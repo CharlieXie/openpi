@@ -95,7 +95,8 @@ def setup_ddp():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     use_ddp = world_size > 1
     if use_ddp and not torch.distributed.is_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        # backend = "nccl" if torch.cuda.is_available() else "gloo"
+        backend = "gloo"
         torch.distributed.init_process_group(backend=backend, init_method="env://")
 
         # Set up debugging environment variables for DDP issues
@@ -427,7 +428,7 @@ def train_loop(config: _config.TrainConfig):
         safetensors.torch.load_model(model, model_path)
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
-    # Apply LoRA AFTER loading pretrained weights
+    # # Apply LoRA AFTER loading pretrained weights
     if lora_enabled:
         logging.info("Applying LoRA adapters to model...")
         frozen_count, trainable_count = lora_utils.apply_lora_to_pi0_pytorch(model, config.lora_config)

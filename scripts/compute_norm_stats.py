@@ -15,7 +15,7 @@ import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.transforms as transforms
 
-
+import pathlib
 class RemoveStrings(transforms.DataTransformFn):
     def __call__(self, x: dict) -> dict:
         return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
@@ -86,7 +86,8 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
+# def main(config_name: str, max_frames: int | None = None):
+def main(config_name: str, max_frames: int | None = None, assets_base_dir: str | None = None, num_workers: int | None = None):
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
 
@@ -107,7 +108,10 @@ def main(config_name: str, max_frames: int | None = None):
             stats[key].update(np.asarray(batch[key]))
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
-
+    if assets_base_dir is not None:
+        output_path = pathlib.Path(assets_base_dir) / config.name / data_config.repo_id
+    else:
+        output_path = config.assets_dirs / data_config.repo_id
     output_path = config.assets_dirs / data_config.repo_id
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)

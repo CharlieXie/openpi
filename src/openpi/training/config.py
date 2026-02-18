@@ -780,17 +780,17 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
-        batch_size=16,
+        batch_size=384,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=1e-4,  # Higher LR for LoRA
-            decay_steps=30_000,
+            warmup_steps=40,
+            peak_lr=2e-4,  # Higher LR for LoRA
+            decay_steps=1250,
             decay_lr=1e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=None,  # Disable EMA for LoRA training
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        num_train_steps=30_000,
+        pytorch_weight_path="/workspace/models/pi05_base_pytorch",
+        num_train_steps=1250,
         # PyTorch LoRA configuration
         lora_config=lora_pytorch.LoRATrainingConfig(
             enabled=True,
