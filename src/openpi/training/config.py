@@ -771,7 +771,7 @@ _CONFIGS = [
             pi05=True,
             action_horizon=10,
             discrete_state_input=False,
-            # Use standard variants - LoRA will be applied dynamically
+            # Use standard variants - LoRA will be applied dynamically 
             paligemma_variant="gemma_2b",
             action_expert_variant="gemma_300m",
         ),
@@ -781,6 +781,8 @@ _CONFIGS = [
             extra_delta_transform=False,
         ),
         batch_size=384,
+        # total frame is 66984.
+        #  100 step works 50% successfully.
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=40,
             peak_lr=2e-4,  # Higher LR for LoRA
