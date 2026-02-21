@@ -1,0 +1,52 @@
+# Waypoint Action Expert training config — R1 Lite
+# Usage: torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_waypoint.py --mode ae --config configs/waypoint_ae_r1lite.yaml
+
+robot_type: galaxea_r1_lite
+
+# Data paths (update these to your actual paths)
+original_rlds_dir: /workspace/r1lite_data/part1_r1_lite_compressed
+wp_indices_path: /workspace/r1lite_data/part1_r1_lite_compressed_wp_0001/waypoint_indices.json
+dataset_statistics_path: /workspace/r1lite_data/part1_r1_lite_compressed_wp_0001
+
+# Model dimensions
+model_action_dim: 32
+model_proprio_dim: 32
+horizon_steps: 32
+max_duration: 32
+max_token_len: 64
+
+# Model architecture
+paligemma_variant: gemma_2b
+action_expert_variant: gemma_300m
+precision: bfloat16
+
+# Pretrained weights (Pi0.5 base)
+pretrained_weight_path: /workspace/models/pi05_base_pytorch
+
+# Training hyperparameters
+batch_size: 32
+num_train_steps: 100000
+warmup_steps: 1000
+peak_lr: 5.0e-5
+end_lr: 1.0e-6
+
+# Normalization
+norm_type: q99
+
+# Shuffle
+shuffle_buffer_size: 10000
+
+# Logging and checkpointing
+exp_name: waypoint_ae_r1lite
+checkpoint_dir: checkpoints/waypoint_ae_r1lite
+save_interval: 5000
+log_interval: 100
+wandb_enabled: true
+
+# LoRA
+lora_enabled: false
+lora_rank: 16
+lora_alpha: 16.0
+train_vision_encoder: true
+
+resume: false
