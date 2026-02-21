@@ -1,6 +1,6 @@
 # Waypoint VLA — openpi 实现设计文档
 
-> 最后更新: 2026-02-21 (rev 2)
+> 最后更新: 2026-02-21 (rev 3 — VLM finetune 验证通过)
 > 基于 Pi0.5 (PyTorch) 在 openpi 项目中实现两段式 Waypoint VLA 系统
 
 ---
@@ -59,9 +59,10 @@ openpi/
 | 用途 | 路径 |
 |------|------|
 | 原始 RLDS (AE 训练) | `/workspace/data/libero/libero_object_no_noops/` |
-| Waypoint-filtered RLDS (VLM 训练) | `/workspace/data/libero/libero_object_wp_001/waypoint_filtered_rlds__libero/` |
+| Waypoint-filtered RLDS (VLM 训练) | `/workspace/data/libero/libero_object_wp_001/waypoint_filtered_rlds__libero/1.0.0/` |
 | Waypoint indices JSON (AE 训练) | `/workspace/data/libero/libero_object_wp_001/waypoint_indices.json` |
-| 归一化统计量 | `/workspace/data/libero_object_no_noops/1.0.0/dataset_statistics_*.json` |
+| 归一化统计量 (AE) | `/workspace/data/libero_object_no_noops/1.0.0/dataset_statistics_*.json` |
+| 归一化统计量 (VLM) | `/workspace/data/libero/libero_object_wp_001/norm_stats/dataset_statistics.json` |
 
 **LIBERO 数据统计:**
 - 原始: 454 个 episode, 66,984 步
@@ -330,9 +331,31 @@ torchrun --standalone --nnodes=1 --nproc_per_node=2 \
 ### VLM
 
 ```bash
-torchrun --standalone --nnodes=1 --nproc_per_node=2 \
+cd /workspace/openpi
+
+# 必须使用 venv 的 torchrun（系统 torchrun 使用错误的 Python 解释器）
+# 必须设置 expandable_segments 避免 CUDA 内存碎片化导致 OOM
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  .venv/bin/torchrun --standalone --nnodes=1 --nproc_per_node=2 \
   scripts/train_waypoint.py \
   --mode vlm --config configs/waypoint_vlm_libero.yaml
+
+# 断点续训
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  .venv/bin/torchrun --standalone --nnodes=1 --nproc_per_node=2 \
+  scripts/train_waypoint.py \
+  --mode vlm --config configs/waypoint_vlm_libero.yaml --resume
+```
+
+### 归一化统计量生成
+
+VLM 和 AE 都需要 q99 归一化统计量。如需从 waypoint-filtered RLDS 重新计算：
+
+```bash
+.venv/bin/python scripts/compute_wp_norm_stats.py \
+  --rlds_dir /workspace/data/libero/libero_object_wp_001/waypoint_filtered_rlds__libero/1.0.0 \
+  --robot_type libero \
+  --output_dir /workspace/data/libero/libero_object_wp_001/norm_stats
 ```
 
 ### 评测
@@ -377,10 +400,14 @@ lora_enabled: false
 ### `waypoint_vlm_libero.yaml`
 
 ```yaml
-wp_rlds_dir: /workspace/data/libero/libero_object_wp_001/waypoint_filtered_rlds__libero
+wp_rlds_dir: /workspace/data/libero/libero_object_wp_001/waypoint_filtered_rlds__libero/1.0.0
+dataset_statistics_path: /workspace/data/libero/libero_object_wp_001/norm_stats
+# ↑ 注意: wp_rlds_dir 必须指向含 dataset_info.json 的 1.0.0 子目录
+
 num_waypoints: 7
 max_token_len: 256
 stride: 4              # 每隔 4 步采样一次 VLM 训练样本
+batch_size: 12         # per GPU; DDP 2 卡有效 batch=24
 ```
 
 ---
@@ -438,15 +465,32 @@ Project: `waypoint_vla`
 - TFDS `builder_from_directory` 需要指向**直接包含** `dataset_info.json` 的目录
 - LIBERO: `/workspace/data/libero/libero_object_no_noops/libero_object_no_noops/1.0.0`（注意两层嵌套）
 
+### VLM Gradient Checkpointing
+- VLM 使用 HuggingFace 的 `PaliGemmaForConditionalGeneration`，**不是** openpi 自定义的 `PaliGemmaWithExpertModel`
+- AE 的 `PaliGemmaWithExpertModel` 在 `gemma_pytorch.py` 中手动实现了逐层 `torch.utils.checkpoint.checkpoint`
+- VLM 必须通过 HuggingFace API 激活 checkpointing：`self.paligemma.gradient_checkpointing_enable()`
+  - 这会让每个 `GemmaDecoderLayer`（继承自 `GradientCheckpointingLayer`）在 `__call__` 中自动 checkpoint
+  - 仅设置 `gradient_checkpointing = True` 属性**无效**——只会关闭 `use_cache`，不会减少激活内存
+- 未正确激活时：batch_size=4 即接近 OOM（~94 GiB）；正确激活后：batch_size=16 单卡可用（~93 GiB）
+
+### VLM Shuffle Buffer 启动策略
+- VLM dataset 的 `__iter__` 必须使用 early-yield 策略（buffer 有 32 条即开始 yield），与 AE 一致
+- 若等待 buffer 完全填满（如 5000 条），首个 batch 需 ~6 分钟（RLDS 遍历 5+ 轮）
+
 ### 依赖项
 - openpi venv 默认不含 TensorFlow
 - 需手动安装: `uv pip install --python .venv/bin/python "tensorflow==2.15.0" "tensorflow-datasets==4.9.3"`
+
+### torchrun 路径
+- 必须使用 `.venv/bin/torchrun`，系统 `torchrun`（`/venv/main/bin/torchrun`）会用错误的 Python 解释器，导致 `ModuleNotFoundError: No module named 'safetensors'`
 
 ---
 
 ## 十三、Batch Size 调优 (2x RTX PRO 6000 Blackwell 97.9GB)
 
-每个 rank 独立运行 DataLoader，`batch_size` 是**单 GPU** 的 batch 大小：
+每个 rank 独立运行 DataLoader，`batch_size` 是**单 GPU** 的 batch 大小。
+
+### Action Expert
 
 | batch_size (per GPU) | 实测 GPU 内存 | 有效总 batch | 备注 |
 |----------------------|--------------|-------------|------|
@@ -455,3 +499,15 @@ Project: `waypoint_vla`
 | 64 | ~88 GB / ~78 GB | 128 | 偏激进，约 10GB 余量 |
 
 配合 LR 线性缩放规则: `peak_lr = 5e-5 × (new_batch / 64)`，即 batch=96 → `6e-5`
+
+### VLM
+
+VLM 全量 finetune PaliGemma 2B，内存占用显著高于 AE（因优化器状态和更长的序列）。
+需要 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 避免 CUDA 内存碎片化。
+
+| batch_size (per GPU) | 实测 GPU 内存 | 有效总 batch | 备注 |
+|----------------------|--------------|-------------|------|
+| 4 | ~48 GB | 8 | 单卡调试可用 |
+| 12 | ~91-93 GB | 24 | **DDP 推荐** — 两卡均有 ~3-5 GB 余量 |
+| 16 | ~93-94 GB | 32 | 单卡勉强可用，DDP OOM（DDP 额外开销） |
+| 32 | OOM | — | 需 LoRA 或梯度累积 |

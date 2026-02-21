@@ -63,13 +63,13 @@ class PI0WaypointVLM(nn.Module):
 
     def gradient_checkpointing_enable(self):
         self.gradient_checkpointing_enabled = True
-        self.paligemma.language_model.gradient_checkpointing = True
-        self.paligemma.vision_tower.gradient_checkpointing = True
+        self.paligemma.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
 
     def gradient_checkpointing_disable(self):
         self.gradient_checkpointing_enabled = False
-        self.paligemma.language_model.gradient_checkpointing = False
-        self.paligemma.vision_tower.gradient_checkpointing = False
+        self.paligemma.gradient_checkpointing_disable()
 
     def _ckpt(self, func, *args, **kwargs):
         if self.gradient_checkpointing_enabled and self.training:

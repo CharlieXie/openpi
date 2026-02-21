@@ -1,0 +1,34 @@
+# Debug VLM config — small batch + small shuffle buffer for fast iteration
+robot_type: libero
+
+wp_rlds_dir: /workspace/data/libero/libero_object_wp_001/waypoint_filtered_rlds__libero/1.0.0
+dataset_statistics_path: /workspace/data/libero/libero_object_wp_001/norm_stats
+
+paligemma_variant: gemma_2b
+action_expert_variant: gemma_300m
+precision: bfloat16
+
+num_waypoints: 7
+max_token_len: 256
+stride: 4
+
+pretrained_weight_path: /workspace/models/pi05_base_pytorch
+
+batch_size: 16
+num_train_steps: 20
+warmup_steps: 5
+peak_lr: 5.0e-5
+end_lr: 1.0e-6
+
+norm_type: q99
+shuffle_buffer_size: 50
+
+exp_name: waypoint_vlm_debug
+checkpoint_dir: checkpoints/waypoint_vlm_debug
+save_interval: 100000
+log_interval: 1
+wandb_enabled: false
+
+lora_enabled: false
+train_vision_encoder: true
+resume: false

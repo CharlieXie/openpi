@@ -4,8 +4,8 @@
 robot_type: libero
 
 # Data paths
-wp_rlds_dir: /workspace/data/libero/libero_object_wp_001/waypoint_filtered_rlds__libero
-dataset_statistics_path: /workspace/data/libero_object_no_noops/1.0.0
+wp_rlds_dir: /workspace/data/libero/libero_object_wp_001/waypoint_filtered_rlds__libero/1.0.0
+dataset_statistics_path: /workspace/data/libero/libero_object_wp_001/norm_stats
 
 # Model architecture
 paligemma_variant: gemma_2b
@@ -21,7 +21,7 @@ stride: 4
 pretrained_weight_path: /workspace/models/pi05_base_pytorch
 
 # Training hyperparameters
-batch_size: 32
+batch_size: 12
 num_train_steps: 30000
 warmup_steps: 500
 peak_lr: 5.0e-5

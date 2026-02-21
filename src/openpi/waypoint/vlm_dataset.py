@@ -191,7 +191,11 @@ class WaypointVLMDataset(IterableDataset):
         buffer = []
         for sample in self._raw_sample_iter():
             buffer.append(sample)
-            if len(buffer) >= self.shuffle_buffer_size:
+            if len(buffer) < self.shuffle_buffer_size:
+                if len(buffer) >= min(32, self.shuffle_buffer_size):
+                    idx = np.random.randint(len(buffer))
+                    yield buffer.pop(idx)
+            else:
                 idx = np.random.randint(len(buffer))
                 yield buffer.pop(idx)
 
