@@ -793,6 +793,7 @@ _CONFIGS = [
         ema_decay=None,  # Disable EMA for LoRA training
         pytorch_weight_path="/workspace/models/pi05_base_pytorch",
         num_train_steps=1250,
+        log_interval=10,
         # PyTorch LoRA configuration
         lora_config=lora_pytorch.LoRATrainingConfig(
             enabled=True,
