@@ -60,7 +60,7 @@ rlds = [
 ]
 
 [tool.uv]
-override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
+override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74", "av>=13.1.0,<14.0.0"]
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
