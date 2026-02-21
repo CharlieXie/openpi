@@ -12,7 +12,6 @@ Usage:
 """
 
 import argparse
-import dataclasses
 import gc
 import logging
 import os
@@ -56,7 +55,9 @@ def setup_ddp():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     use_ddp = world_size > 1
     if use_ddp and not dist.is_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        # Use gloo — nccl has compatibility issues in this environment
+        # (matches the behaviour of the existing train_pytorch.py)
+        backend = "gloo"
         dist.init_process_group(backend=backend, init_method="env://")
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
@@ -118,6 +119,33 @@ def cosine_lr(step, warmup, peak_lr, decay_steps, end_lr):
 # Action Expert training
 # ---------------------------------------------------------------------------
 
+def count_params(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
+
+
+def init_wandb(cfg, mode, is_main, resuming=False):
+    if not is_main or not cfg.get("wandb_enabled", True):
+        wandb.init(mode="disabled")
+        return
+    run_name = cfg.get("exp_name", f"waypoint_{mode}")
+    project = cfg.get("wandb_project", "waypoint_vla")
+    run_id_file = Path(cfg.get("checkpoint_dir", "checkpoints")) / "wandb_run_id.txt"
+    if resuming and run_id_file.exists():
+        run_id = run_id_file.read_text().strip()
+        wandb.init(id=run_id, resume="must", project=project)
+    else:
+        wandb.init(
+            name=run_name,
+            project=project,
+            config={k: v for k, v in cfg.items() if not isinstance(v, (dict, list))},
+            tags=[mode, cfg.get("robot_type", ""), cfg.get("paligemma_variant", "")],
+        )
+        run_id_file.parent.mkdir(parents=True, exist_ok=True)
+        run_id_file.write_text(wandb.run.id)
+
+
 def train_ae(cfg, device, use_ddp, is_main):
     from openpi.waypoint.ae_dataset import WaypointAEDataset, WaypointAECollator
     from openpi.waypoint.ae_model import PI0WaypointAE
@@ -162,7 +190,22 @@ def train_ae(cfg, device, use_ddp, is_main):
     if cfg.get("pretrained_weight_path"):
         logging.info(f"Loading pretrained weights from {cfg['pretrained_weight_path']}")
         weight_path = os.path.join(cfg["pretrained_weight_path"], "model.safetensors")
-        safetensors.torch.load_model(model, weight_path, strict=False)
+        # time_mlp_in is intentionally resized from [W,W] → [2W,W] to accept
+        # cat(time_emb, dur_emb). Skip it during weight loading and keep random init.
+        state_dict = safetensors.torch.load_file(weight_path, device=str(device))
+        own_state = model.state_dict()
+        loaded, skipped = 0, 0
+        for name, param in state_dict.items():
+            if name not in own_state:
+                skipped += 1
+                continue
+            if own_state[name].shape != param.shape:
+                logging.info(f"  Skipping {name}: shape {param.shape} != {own_state[name].shape}")
+                skipped += 1
+                continue
+            own_state[name].copy_(param)
+            loaded += 1
+        logging.info(f"Loaded {loaded} weight tensors, skipped {skipped}")
 
     if cfg.get("lora_enabled", False):
         import openpi.models_pytorch.lora_pytorch as lora_utils
@@ -203,8 +246,16 @@ def train_ae(cfg, device, use_ddp, is_main):
     num_steps = cfg.get("num_train_steps", 30000)
     log_interval = cfg.get("log_interval", 50)
 
-    if is_main and cfg.get("wandb_enabled", True):
-        wandb.init(name=cfg.get("exp_name", "waypoint_ae"), project="waypoint_vla")
+    resuming = cfg.get("resume", False)
+    init_wandb(cfg, "ae", is_main, resuming=resuming)
+
+    if is_main:
+        total_p, trainable_p = count_params(model)
+        logging.info(f"Model: {total_p/1e6:.1f}M total, {trainable_p/1e6:.1f}M trainable")
+        if wandb.run and wandb.run.mode != "disabled":
+            wandb.run.summary["total_params"] = total_p
+            wandb.run.summary["trainable_params"] = trainable_p
+            wandb.run.summary["dataset_pairs"] = dataset.total_pairs
 
     model.train()
     pbar = tqdm.tqdm(total=num_steps, initial=global_step, desc="AE Training") if is_main else None
@@ -216,9 +267,9 @@ def train_ae(cfg, device, use_ddp, is_main):
             break
 
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-        for k in batch.get("images", {}):
+        for k in list(batch.get("images", {}).keys()):
             batch["images"][k] = batch["images"][k].to(device)
-        for k in batch.get("image_masks", {}):
+        for k in list(batch.get("image_masks", {}).keys()):
             batch["image_masks"][k] = batch["image_masks"][k].to(device)
 
         for pg in optimizer.param_groups:
@@ -228,7 +279,7 @@ def train_ae(cfg, device, use_ddp, is_main):
             def __init__(self, b):
                 self.images = b["images"]
                 self.image_masks = b["image_masks"]
-                self.state = batch["start_proprio"]
+                self.state = b["start_proprio"]
                 self.tokenized_prompt = b["prompt_tokens"]
                 self.tokenized_prompt_mask = b["prompt_masks"]
                 self.token_ar_mask = None
@@ -252,14 +303,25 @@ def train_ae(cfg, device, use_ddp, is_main):
         optimizer.zero_grad(set_to_none=True)
 
         if is_main:
-            infos.append({"loss": loss.item(), "lr": optimizer.param_groups[0]["lr"], "grad_norm": float(grad_norm)})
+            infos.append({
+                "train/loss": loss.item(),
+                "train/lr": optimizer.param_groups[0]["lr"],
+                "train/grad_norm": float(grad_norm),
+            })
 
         if is_main and global_step % log_interval == 0 and infos:
-            avg = {k: np.mean([i[k] for i in infos]) for k in infos[0]}
+            avg = {k: float(np.mean([i[k] for i in infos])) for k in infos[0]}
             elapsed = time.time() - start_time
-            logging.info(f"step={global_step} loss={avg['loss']:.4f} lr={avg['lr']:.2e} gnorm={avg['grad_norm']:.2f} t={elapsed:.1f}s")
-            if cfg.get("wandb_enabled", True):
-                wandb.log({**avg, "step": global_step}, step=global_step)
+            steps_per_sec = log_interval / max(elapsed, 1e-6)
+            logging.info(
+                f"[AE] step={global_step}/{num_steps} "
+                f"loss={avg['train/loss']:.4f} "
+                f"lr={avg['train/lr']:.2e} "
+                f"gnorm={avg['train/grad_norm']:.2f} "
+                f"sps={steps_per_sec:.1f}"
+            )
+            avg["train/steps_per_sec"] = steps_per_sec
+            wandb.log(avg, step=global_step)
             infos = []
             start_time = time.time()
 
@@ -267,12 +329,11 @@ def train_ae(cfg, device, use_ddp, is_main):
         save_checkpoint(model, optimizer, global_step, save_dir, is_main, save_interval)
         if pbar:
             pbar.update(1)
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            pbar.set_postfix(loss=f"{loss.item():.4f}", step=global_step)
 
     if pbar:
         pbar.close()
-    if is_main and cfg.get("wandb_enabled", True):
-        wandb.finish()
+    wandb.finish()
 
 
 # ---------------------------------------------------------------------------
@@ -380,8 +441,15 @@ def train_vlm(cfg, device, use_ddp, is_main):
     num_steps = cfg.get("num_train_steps", 30000)
     log_interval = cfg.get("log_interval", 50)
 
-    if is_main and cfg.get("wandb_enabled", True):
-        wandb.init(name=cfg.get("exp_name", "waypoint_vlm"), project="waypoint_vla")
+    resuming = cfg.get("resume", False)
+    init_wandb(cfg, "vlm", is_main, resuming=resuming)
+
+    if is_main:
+        total_p, trainable_p = count_params(model)
+        logging.info(f"Model: {total_p/1e6:.1f}M total, {trainable_p/1e6:.1f}M trainable")
+        if wandb.run and wandb.run.mode != "disabled":
+            wandb.run.summary["total_params"] = total_p
+            wandb.run.summary["trainable_params"] = trainable_p
 
     model.train()
     pbar = tqdm.tqdm(total=num_steps, initial=global_step, desc="VLM Training") if is_main else None
@@ -393,9 +461,9 @@ def train_vlm(cfg, device, use_ddp, is_main):
             break
 
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-        for k in batch.get("images", {}):
+        for k in list(batch.get("images", {}).keys()):
             batch["images"][k] = batch["images"][k].to(device)
-        for k in batch.get("image_masks", {}):
+        for k in list(batch.get("image_masks", {}).keys()):
             batch["image_masks"][k] = batch["image_masks"][k].to(device)
 
         for pg in optimizer.param_groups:
@@ -410,14 +478,25 @@ def train_vlm(cfg, device, use_ddp, is_main):
         optimizer.zero_grad(set_to_none=True)
 
         if is_main:
-            infos.append({"loss": loss.item(), "lr": optimizer.param_groups[0]["lr"], "grad_norm": float(grad_norm)})
+            infos.append({
+                "train/loss": loss.item(),
+                "train/lr": optimizer.param_groups[0]["lr"],
+                "train/grad_norm": float(grad_norm),
+            })
 
         if is_main and global_step % log_interval == 0 and infos:
-            avg = {k: np.mean([i[k] for i in infos]) for k in infos[0]}
+            avg = {k: float(np.mean([i[k] for i in infos])) for k in infos[0]}
             elapsed = time.time() - start_time
-            logging.info(f"step={global_step} loss={avg['loss']:.4f} lr={avg['lr']:.2e} gnorm={avg['grad_norm']:.2f} t={elapsed:.1f}s")
-            if cfg.get("wandb_enabled", True):
-                wandb.log({**avg, "step": global_step}, step=global_step)
+            steps_per_sec = log_interval / max(elapsed, 1e-6)
+            logging.info(
+                f"[VLM] step={global_step}/{num_steps} "
+                f"loss={avg['train/loss']:.4f} "
+                f"lr={avg['train/lr']:.2e} "
+                f"gnorm={avg['train/grad_norm']:.2f} "
+                f"sps={steps_per_sec:.1f}"
+            )
+            avg["train/steps_per_sec"] = steps_per_sec
+            wandb.log(avg, step=global_step)
             infos = []
             start_time = time.time()
 
@@ -425,12 +504,11 @@ def train_vlm(cfg, device, use_ddp, is_main):
         save_checkpoint(model, optimizer, global_step, save_dir, is_main, save_interval)
         if pbar:
             pbar.update(1)
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            pbar.set_postfix(loss=f"{loss.item():.4f}", step=global_step)
 
     if pbar:
         pbar.close()
-    if is_main and cfg.get("wandb_enabled", True):
-        wandb.finish()
+    wandb.finish()
 
 
 # ---------------------------------------------------------------------------

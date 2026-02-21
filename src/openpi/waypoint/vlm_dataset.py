@@ -205,8 +205,9 @@ class WaypointVLMCollator:
         all_images = {}
         all_image_masks = {}
         for key in ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"]:
-            imgs = np.stack([s["images"][key] for s in batch])
+            imgs = np.stack([s["images"][key] for s in batch])  # (B, H, W, C)
             imgs = imgs.astype(np.float32) / 127.5 - 1.0
+            imgs = imgs.transpose(0, 3, 1, 2)  # (B, C, H, W)
             all_images[key] = torch.from_numpy(imgs)
             masks = [s["image_masks"].get(key, False) for s in batch]
             all_image_masks[key] = torch.tensor(masks, dtype=torch.bool)

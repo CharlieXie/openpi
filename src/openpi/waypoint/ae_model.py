@@ -57,6 +57,10 @@ class PI0WaypointAE(nn.Module):
 
         self.proprio_encoder = nn.Linear(self.action_dim, expert_width)
 
+        # time_mlp_in takes cat(time_emb, dur_emb) = 2*W → W
+        # NOTE: the Pi0.5 base checkpoint has time_mlp_in as W→W.
+        # We initialize fresh weights for time_mlp_in; all other layers
+        # can be loaded from the base checkpoint via strict=False.
         self.time_mlp_in = nn.Linear(2 * expert_width, expert_width)
         self.time_mlp_out = nn.Linear(expert_width, expert_width)
 
@@ -121,8 +125,8 @@ class PI0WaypointAE(nn.Module):
         expert_width = self.action_in_proj.out_features
 
         proprio_input = torch.stack([start_proprio, end_proprio], dim=1)  # (B, 2, D)
-        if self.proprio_encoder.weight.dtype == torch.bfloat16:
-            proprio_input = proprio_input.to(torch.bfloat16)
+        # Always cast to match weight dtype (bfloat16 in Pi0.5 mode)
+        proprio_input = proprio_input.to(self.proprio_encoder.weight.dtype)
         proprio_emb = self._ckpt(self.proprio_encoder, proprio_input)  # (B, 2, W)
         embs.append(proprio_emb)
         pad_masks.append(torch.ones(bsize, 2, dtype=torch.bool, device=device))
@@ -138,12 +142,15 @@ class PI0WaypointAE(nn.Module):
         ).to(timestep.dtype)
 
         combined = torch.cat([time_emb, dur_emb], dim=-1)  # (B, 2*W)
+        # Cast to match time_mlp_in weight dtype (bfloat16 in Pi0.5 mode)
+        combined = combined.to(self.time_mlp_in.weight.dtype)
         x = self.time_mlp_in(combined)
         x = F.silu(x)
         x = self.time_mlp_out(x)
         adarms_cond = F.silu(x)
 
-        action_emb = self._ckpt(self.action_in_proj, noisy_actions)
+        noisy_actions_cast = noisy_actions.to(self.action_in_proj.weight.dtype)
+        action_emb = self._ckpt(self.action_in_proj, noisy_actions_cast)
         embs.append(action_emb)
         pad_masks.append(torch.ones(bsize, self.action_horizon, dtype=torch.bool, device=device))
         att_masks += [1] + [0] * (self.action_horizon - 1)
@@ -172,7 +179,6 @@ class PI0WaypointAE(nn.Module):
         Returns:
             loss: scalar mean loss.
         """
-        from openpi.models_pytorch.pi0_pytorch import preprocess_observation_pytorch
         import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
         obs = _preprocessing.preprocess_observation_pytorch(observation, train=True)
         images = list(obs.images.values())
@@ -245,8 +251,8 @@ class PI0WaypointAE(nn.Module):
         noise=None,
     ):
         """Inference: generate action chunk via iterative denoising."""
-        import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
-        obs = _preprocessing.preprocess_observation_pytorch(observation, train=False)
+        import openpi.models_pytorch.preprocessing_pytorch as _prep
+        obs = _prep.preprocess_observation_pytorch(observation, train=False)
         images = list(obs.images.values())
         img_masks = list(obs.image_masks.values())
         lang_tokens = obs.tokenized_prompt

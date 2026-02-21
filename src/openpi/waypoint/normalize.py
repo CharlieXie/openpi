@@ -101,7 +101,12 @@ def extract_proprio_from_obs(step_obs: dict, state_obs_keys: list[str]) -> np.nd
 
 
 class NormalizationHelper:
-    """Wraps normalization statistics and provides normalize/unnormalize methods."""
+    """Wraps normalization statistics and provides normalize/unnormalize methods.
+
+    Supports two stat file layouts:
+      1. Flat:   {"action": {"mean":..., "q01":..., ...}, "proprio": {...}}
+      2. Nested: {"libero": {"action": {...}, "proprio": {...}}, ...}
+    """
 
     def __init__(self, dataset_statistics: dict[str, Any], norm_type: str = "q99"):
         self.norm_type = norm_type
@@ -111,8 +116,10 @@ class NormalizationHelper:
         self.action_std = np.array(stats["action"]["std"], dtype=np.float32)
         self.action_q01 = np.array(stats["action"]["q01"], dtype=np.float32)
         self.action_q99 = np.array(stats["action"]["q99"], dtype=np.float32)
+        # Default norm mask: True for all dims (all normalized). Callers can override.
+        n_action = len(self.action_mean)
         self.action_norm_mask = np.array(
-            stats["action"].get("mask", np.ones_like(self.action_mean, dtype=bool)),
+            stats["action"].get("mask", [True] * n_action),
             dtype=bool,
         )
 
@@ -123,10 +130,17 @@ class NormalizationHelper:
 
     @staticmethod
     def _find_stats(dataset_statistics: dict) -> dict:
+        # Layout 1: flat {"action": {...}, "proprio": {...}}
+        if "action" in dataset_statistics and "proprio" in dataset_statistics:
+            return dataset_statistics
+        # Layout 2: nested {"dataset_name": {"action": {...}, "proprio": {...}}}
         for key, val in dataset_statistics.items():
             if key != "__total__" and isinstance(val, dict) and "action" in val:
                 return val
-        raise ValueError("Cannot find action/proprio stats in dataset_statistics")
+        raise ValueError(
+            "Cannot find action/proprio stats. Expected either flat "
+            '{"action": {...}, "proprio": {...}} or nested {"name": {"action": ...}}'
+        )
 
     def normalize_actions(self, actions: np.ndarray) -> np.ndarray:
         if self.norm_type in ("q99", "bounds_q99"):

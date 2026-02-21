@@ -145,7 +145,8 @@ class RobotConfig:
 
 def make_libero_config() -> RobotConfig:
     action_dims = list(range(7))
-    norm_mask = np.array([True] * 6 + [False], dtype=bool)  # gripper not normalized
+    # Gripper (dim 6) is already in [0,1] after normalize_gripper_libero → skip normalization
+    norm_mask = np.array([True] * 6 + [False], dtype=bool)
     return RobotConfig(
         robot_type="libero",
         actual_action_dim=7,

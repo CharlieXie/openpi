@@ -4,7 +4,7 @@
 robot_type: libero
 
 # Data paths
-original_rlds_dir: /workspace/data/libero/libero_object_no_noops
+original_rlds_dir: /workspace/data/libero/libero_object_no_noops/libero_object_no_noops/1.0.0
 wp_indices_path: /workspace/data/libero/libero_object_wp_001/waypoint_indices.json
 dataset_statistics_path: /workspace/data/libero_object_no_noops/1.0.0
 
@@ -24,23 +24,38 @@ precision: bfloat16
 pretrained_weight_path: /workspace/models/pi05_base_pytorch
 
 # Training hyperparameters
-batch_size: 32
-num_train_steps: 30000
-warmup_steps: 500
-peak_lr: 5.0e-5
+# batch_size is per GPU (each rank loads independently via IterableDataset DDP split).
+# With 2 GPUs: effective total batch = batch_size * 2.
+# Memory profiling on 2x RTX PRO 6000 Blackwell (97.9 GB each):
+#   batch=32  → 59.1 GB / 50.1 GB  (38.8 / 47.8 GB free)  ← ~261 MiB/sample (measured)
+#   batch=48  → 63.3 GB / 54.3 GB  (34.6 / 43.6 GB free)
+#   batch=128 → 75.2 GB / 66.1 GB  (22.1 / 31.1 GB free)  ← ~148 MiB/sample (measured)
+# Memory profiling (all values measured after step=1 forward+backward+optimizer):
+#   batch=32  → 59.1 GB / 50.1 GB  (38.8 / 47.8 GB free)
+#   batch=48  → 63.3 GB / 54.3 GB  (34.6 / 43.6 GB free)
+#   batch=128 → 75.2 GB / 66.1 GB  (22.1 / 31.1 GB free)
+#   batch=144 → 78.7 GB / 69.7 GB  (18.5 / 27.6 GB free)  ← SAFE MAXIMUM
+#   batch=160 → 97.1 GB / 89.6 GB  (0.1 / 7.6 GB free!)   ← OOM IMMINENT, DO NOT USE
+#   batch=192 → 95.9 GB / 86.8 GB  (1.3 GB free!)         ← OOM RISK, DO NOT USE
+# NOTE: batch=144→160 causes nonlinear memory jump (~1149 MiB/sample vs ~223 at 128→144)
+#       likely due to DDP gradient sync buffer threshold being crossed
+batch_size: 144
+num_train_steps: 10000   # 144×2=288 effective batch; 10k steps ≈ 2.88M samples seen
+warmup_steps: 20
+peak_lr: 9.0e-5           # sqrt LR scaling: 5e-5 × sqrt(288/64) ≈ 1.06e-4, conservative 9e-5
 end_lr: 1.0e-6
 
 # Normalization
 norm_type: q99
 
 # Shuffle
-shuffle_buffer_size: 10000
+shuffle_buffer_size: 1000
 
 # Logging and checkpointing
 exp_name: waypoint_ae_libero
 checkpoint_dir: checkpoints/waypoint_ae_libero
-save_interval: 2000
-log_interval: 50
+save_interval: 50
+log_interval: 5
 wandb_enabled: true
 
 # LoRA (set to true for low-memory training)

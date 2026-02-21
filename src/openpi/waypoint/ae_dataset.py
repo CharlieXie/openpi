@@ -66,6 +66,10 @@ class WaypointAEDataset(IterableDataset):
 
         self.norm_helper = NormalizationHelper(dataset_statistics, norm_type)
 
+        # Override action_norm_mask from robot_config if provided (e.g. gripper not normalized)
+        if robot_config.action_norm_mask is not None:
+            self.norm_helper.action_norm_mask = robot_config.action_norm_mask
+
         self.action_dim_mask = make_dim_mask(robot_config.actual_action_dim, model_action_dim)
         self.proprio_dim_mask = make_dim_mask(robot_config.actual_proprio_dim, model_proprio_dim)
 
@@ -201,11 +205,21 @@ class WaypointAEDataset(IterableDataset):
                 gc.collect()
 
     def __iter__(self):
-        """Yields shuffled samples via a reservoir-style buffer."""
+        """Yields shuffled samples via a reservoir-style buffer.
+
+        Fill buffer up to shuffle_buffer_size, then for every new sample
+        yield one random item from the buffer (keeps buffer size constant).
+        When raw iter exhausts an epoch, drain remaining buffer then restart.
+        """
         buffer = []
         for sample in self._raw_sample_iter():
             buffer.append(sample)
-            if len(buffer) >= self.shuffle_buffer_size:
+            if len(buffer) < self.shuffle_buffer_size:
+                # Still filling; yield immediately to avoid stalling
+                if len(buffer) >= min(32, self.shuffle_buffer_size):
+                    idx = np.random.randint(len(buffer))
+                    yield buffer.pop(idx)
+            else:
                 idx = np.random.randint(len(buffer))
                 yield buffer.pop(idx)
 
@@ -234,14 +248,15 @@ class WaypointAECollator:
         all_images = {}
         all_image_masks = {}
         for key in batch[0]["images"]:
-            imgs = np.stack([s["images"][key] for s in batch])
+            imgs = np.stack([s["images"][key] for s in batch])  # (B, H, W, C)
             imgs = imgs.astype(np.float32) / 127.5 - 1.0  # [0,255] -> [-1,1]
+            imgs = imgs.transpose(0, 3, 1, 2)  # (B, H, W, C) -> (B, C, H, W)
             all_images[key] = torch.from_numpy(imgs)
             all_image_masks[key] = torch.ones(B, dtype=torch.bool)
 
         for model_key in ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"]:
             if model_key not in all_images:
-                all_images[model_key] = torch.zeros(B, 224, 224, 3, dtype=torch.float32)
+                all_images[model_key] = torch.zeros(B, 3, 224, 224, dtype=torch.float32)
                 all_image_masks[model_key] = torch.zeros(B, dtype=torch.bool)
 
         start_proprio = torch.from_numpy(np.stack([s["start_proprio"] for s in batch]))
