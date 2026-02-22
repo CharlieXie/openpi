@@ -83,7 +83,7 @@ def save_checkpoint(model, optimizer, step, save_dir, is_main, save_interval):
 
     model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
     safetensors.torch.save_model(model_to_save, tmp_dir / "model.safetensors")
-    torch.save(optimizer.state_dict(), tmp_dir / "optimizer.pt")
+    # torch.save(optimizer.state_dict(), tmp_dir / "optimizer.pt")
     torch.save({"global_step": step, "timestamp": time.time()}, tmp_dir / "metadata.pt")
 
     if final_dir.exists():
