@@ -21,7 +21,7 @@ action_expert_variant: gemma_300m
 precision: bfloat16
 
 # Pretrained weights (Pi0.5 base)
-pretrained_weight_path: /workspace/models/pi05_base_pytorch
+pretrained_weight_path: /workspace/openpi/checkpoints/waypoint_ae_libero/2400
 
 # Training hyperparameters
 # batch_size is per GPU (each rank loads independently via IterableDataset DDP split).
@@ -40,10 +40,10 @@ pretrained_weight_path: /workspace/models/pi05_base_pytorch
 # NOTE: batch=144→160 causes nonlinear memory jump (~1149 MiB/sample vs ~223 at 128→144)
 #       likely due to DDP gradient sync buffer threshold being crossed
 batch_size: 144
-num_train_steps: 10000   # 144×2=288 effective batch; 10k steps ≈ 2.88M samples seen
+num_train_steps: 2500    # 144×2=288 effective batch; 2.5k steps ≈ 720K samples seen
 warmup_steps: 20
-peak_lr: 9.0e-5           # sqrt LR scaling: 5e-5 × sqrt(288/64) ≈ 1.06e-4, conservative 9e-5
-end_lr: 1.0e-6
+peak_lr: 1.0e-5           # sqrt LR scaling: 5e-5 × sqrt(288/64) ≈ 1.06e-4, conservative 9e-5
+end_lr: 1.0e-8
 
 # Normalization
 norm_type: q99
@@ -52,9 +52,9 @@ norm_type: q99
 shuffle_buffer_size: 1000
 
 # Logging and checkpointing
-exp_name: waypoint_ae_libero
-checkpoint_dir: checkpoints/waypoint_ae_libero
-save_interval: 50
+exp_name: waypoint_ae_libero_01
+checkpoint_dir: checkpoints/{exp_name}
+save_interval: 150
 log_interval: 5
 wandb_enabled: true
 

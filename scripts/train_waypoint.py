@@ -131,7 +131,8 @@ def init_wandb(cfg, mode, is_main, resuming=False):
         return
     run_name = cfg.get("exp_name", f"waypoint_{mode}")
     project = cfg.get("wandb_project", "waypoint_vla")
-    run_id_file = Path(cfg.get("checkpoint_dir", "checkpoints")) / "wandb_run_id.txt"
+    exp_name = cfg.get("exp_name", f"waypoint_{mode}")
+    run_id_file = Path(cfg.get("checkpoint_dir", "checkpoints").format(exp_name=exp_name)) / "wandb_run_id.txt"
     if resuming and run_id_file.exists():
         run_id = run_id_file.read_text().strip()
         wandb.init(id=run_id, resume="must", project=project)
@@ -186,6 +187,8 @@ def train_ae(cfg, device, use_ddp, is_main):
 
     model = PI0WaypointAE(model_cfg).to(device)
     model.gradient_checkpointing_enable()
+    if is_main:
+        log_gpu_memory(device, prefix="[After model init] ")
 
     if cfg.get("pretrained_weight_path"):
         logging.info(f"Loading pretrained weights from {cfg['pretrained_weight_path']}")
@@ -206,6 +209,8 @@ def train_ae(cfg, device, use_ddp, is_main):
             own_state[name].copy_(param)
             loaded += 1
         logging.info(f"Loaded {loaded} weight tensors, skipped {skipped}")
+        if is_main:
+            log_gpu_memory(device, prefix="[After weight load] ")
 
     if cfg.get("lora_enabled", False):
         import openpi.models_pytorch.lora_pytorch as lora_utils
@@ -230,14 +235,19 @@ def train_ae(cfg, device, use_ddp, is_main):
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=cfg.get("peak_lr", 5e-5), weight_decay=1e-4)
+    if is_main:
+        logging.info(f"Optimizer: AdamW  |  weight_decay=1e-4  |  {len(trainable_params)} param groups")
+        log_gpu_memory(device, prefix="[After optimizer init] ")
 
-    save_dir = Path(cfg.get("checkpoint_dir", "checkpoints/waypoint_ae"))
+    save_dir = Path(cfg.get("checkpoint_dir", "checkpoints/{exp_name}").format(exp_name=cfg.get("exp_name", "waypoint_ae")))
     save_dir.mkdir(parents=True, exist_ok=True)
     save_interval = cfg.get("save_interval", 1000)
 
     global_step = 0
     if cfg.get("resume", False):
         global_step = load_latest_checkpoint(model, optimizer, save_dir, device)
+        if is_main:
+            log_gpu_memory(device, prefix="[After resume] ")
 
     warmup = cfg.get("warmup_steps", 500)
     peak_lr = cfg.get("peak_lr", 5e-5)
@@ -246,12 +256,18 @@ def train_ae(cfg, device, use_ddp, is_main):
     num_steps = cfg.get("num_train_steps", 30000)
     log_interval = cfg.get("log_interval", 50)
 
+    if is_main:
+        init_lr = peak_lr / (warmup + 1)
+        logging.info(f"LR schedule: init={init_lr:.2e} -> peak={peak_lr:.2e} (warmup {warmup} steps) -> end={end_lr:.2e} (cosine over {decay_steps} steps)")
+        logging.info(f"Training: {global_step} -> {num_steps} steps  |  save every {save_interval}  |  log every {log_interval}")
+
     resuming = cfg.get("resume", False)
     init_wandb(cfg, "ae", is_main, resuming=resuming)
 
     if is_main:
         total_p, trainable_p = count_params(model)
         logging.info(f"Model: {total_p/1e6:.1f}M total, {trainable_p/1e6:.1f}M trainable")
+        logging.info(f"Dataset: {dataset.total_pairs:,} sample pairs")
         if wandb.run and wandb.run.mode != "disabled":
             wandb.run.summary["total_params"] = total_p
             wandb.run.summary["trainable_params"] = trainable_p
@@ -313,14 +329,20 @@ def train_ae(cfg, device, use_ddp, is_main):
             avg = {k: float(np.mean([i[k] for i in infos])) for k in infos[0]}
             elapsed = time.time() - start_time
             steps_per_sec = log_interval / max(elapsed, 1e-6)
+            eta_sec = (num_steps - global_step) / max(steps_per_sec, 1e-6)
+            eta_min = eta_sec / 60
+            gpu_alloc = torch.cuda.memory_allocated(device) / 1024**3 if torch.cuda.is_available() else 0
             logging.info(
                 f"[AE] step={global_step}/{num_steps} "
                 f"loss={avg['train/loss']:.4f} "
                 f"lr={avg['train/lr']:.2e} "
                 f"gnorm={avg['train/grad_norm']:.2f} "
-                f"sps={steps_per_sec:.1f}"
+                f"sps={steps_per_sec:.1f} "
+                f"gpu={gpu_alloc:.1f}GB "
+                f"eta={eta_min:.0f}min"
             )
             avg["train/steps_per_sec"] = steps_per_sec
+            avg["train/gpu_mem_gb"] = gpu_alloc
             wandb.log(avg, step=global_step)
             infos = []
             start_time = time.time()
@@ -382,6 +404,8 @@ def train_vlm(cfg, device, use_ddp, is_main):
 
     model = PI0WaypointVLM(model_cfg).to(device)
     model.gradient_checkpointing_enable()
+    if is_main:
+        log_gpu_memory(device, prefix="[After model init] ")
 
     if cfg.get("pretrained_weight_path"):
         logging.info(f"Loading pretrained PaliGemma weights from {cfg['pretrained_weight_path']}")
@@ -403,6 +427,8 @@ def train_vlm(cfg, device, use_ddp, is_main):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        if is_main:
+            log_gpu_memory(device, prefix="[After weight load] ")
 
     if cfg.get("lora_enabled", False):
         import openpi.models_pytorch.lora_pytorch as lora_utils
@@ -425,14 +451,19 @@ def train_vlm(cfg, device, use_ddp, is_main):
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=cfg.get("peak_lr", 5e-5), weight_decay=1e-4)
+    if is_main:
+        logging.info(f"Optimizer: AdamW  |  weight_decay=1e-4  |  {len(trainable_params)} param groups")
+        log_gpu_memory(device, prefix="[After optimizer init] ")
 
-    save_dir = Path(cfg.get("checkpoint_dir", "checkpoints/waypoint_vlm"))
+    save_dir = Path(cfg.get("checkpoint_dir", "checkpoints/{exp_name}").format(exp_name=cfg.get("exp_name", "waypoint_vlm")))
     save_dir.mkdir(parents=True, exist_ok=True)
     save_interval = cfg.get("save_interval", 1000)
 
     global_step = 0
     if cfg.get("resume", False):
         global_step = load_latest_checkpoint(model, optimizer, save_dir, device)
+        if is_main:
+            log_gpu_memory(device, prefix="[After resume] ")
 
     warmup = cfg.get("warmup_steps", 500)
     peak_lr = cfg.get("peak_lr", 5e-5)
@@ -440,6 +471,11 @@ def train_vlm(cfg, device, use_ddp, is_main):
     end_lr = cfg.get("end_lr", 1e-6)
     num_steps = cfg.get("num_train_steps", 30000)
     log_interval = cfg.get("log_interval", 50)
+
+    if is_main:
+        init_lr = peak_lr / (warmup + 1)
+        logging.info(f"LR schedule: init={init_lr:.2e} -> peak={peak_lr:.2e} (warmup {warmup} steps) -> end={end_lr:.2e} (cosine over {decay_steps} steps)")
+        logging.info(f"Training: {global_step} -> {num_steps} steps  |  save every {save_interval}  |  log every {log_interval}")
 
     resuming = cfg.get("resume", False)
     init_wandb(cfg, "vlm", is_main, resuming=resuming)
@@ -488,14 +524,20 @@ def train_vlm(cfg, device, use_ddp, is_main):
             avg = {k: float(np.mean([i[k] for i in infos])) for k in infos[0]}
             elapsed = time.time() - start_time
             steps_per_sec = log_interval / max(elapsed, 1e-6)
+            eta_sec = (num_steps - global_step) / max(steps_per_sec, 1e-6)
+            eta_min = eta_sec / 60
+            gpu_alloc = torch.cuda.memory_allocated(device) / 1024**3 if torch.cuda.is_available() else 0
             logging.info(
                 f"[VLM] step={global_step}/{num_steps} "
                 f"loss={avg['train/loss']:.4f} "
                 f"lr={avg['train/lr']:.2e} "
                 f"gnorm={avg['train/grad_norm']:.2f} "
-                f"sps={steps_per_sec:.1f}"
+                f"sps={steps_per_sec:.1f} "
+                f"gpu={gpu_alloc:.1f}GB "
+                f"eta={eta_min:.0f}min"
             )
             avg["train/steps_per_sec"] = steps_per_sec
+            avg["train/gpu_mem_gb"] = gpu_alloc
             wandb.log(avg, step=global_step)
             infos = []
             start_time = time.time()
@@ -515,6 +557,92 @@ def train_vlm(cfg, device, use_ddp, is_main):
 # Main
 # ---------------------------------------------------------------------------
 
+def log_gpu_info(device):
+    if not torch.cuda.is_available():
+        logging.info("GPU: not available (running on CPU)")
+        return
+    idx = device.index if device.index is not None else 0
+    name = torch.cuda.get_device_name(idx)
+    total_mem = torch.cuda.get_device_properties(idx).total_memory / 1024**3
+    logging.info(f"GPU {idx}: {name}  |  Total memory: {total_mem:.1f} GB")
+
+
+def log_gpu_memory(device, prefix=""):
+    if not torch.cuda.is_available():
+        return
+    idx = device.index if device.index is not None else 0
+    alloc = torch.cuda.memory_allocated(idx) / 1024**3
+    reserved = torch.cuda.memory_reserved(idx) / 1024**3
+    total = torch.cuda.get_device_properties(idx).total_memory / 1024**3
+    logging.info(f"{prefix}GPU mem: {alloc:.1f} GB alloc / {reserved:.1f} GB reserved / {total:.1f} GB total  ({total - alloc:.1f} GB free)")
+
+
+def log_training_config(cfg, mode, device, use_ddp):
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    batch_size = cfg.get("batch_size", 32)
+    effective_batch = batch_size * world_size
+    num_steps = cfg.get("num_train_steps", 30000)
+    total_samples = effective_batch * num_steps
+
+    sep = "=" * 72
+    logging.info(sep)
+    logging.info(f"  WAYPOINT {mode.upper()} TRAINING — Configuration Summary")
+    logging.info(sep)
+
+    logging.info(f"  Mode:                  {mode}")
+    logging.info(f"  Robot type:            {cfg.get('robot_type', 'N/A')}")
+    logging.info(f"  Device:                {device}")
+    logging.info(f"  DDP:                   {use_ddp}  (world_size={world_size})")
+    logging.info(f"  Precision:             {cfg.get('precision', 'N/A')}")
+    logging.info("")
+
+    logging.info("  --- Data ---")
+    if mode == "ae":
+        logging.info(f"  RLDS dir:              {cfg.get('original_rlds_dir', 'N/A')}")
+        logging.info(f"  WP indices:            {cfg.get('wp_indices_path', 'N/A')}")
+    elif mode == "vlm":
+        logging.info(f"  WP RLDS dir:           {cfg.get('wp_rlds_dir', 'N/A')}")
+    logging.info(f"  Dataset stats:         {cfg.get('dataset_statistics_path', 'N/A')}")
+    logging.info(f"  Norm type:             {cfg.get('norm_type', 'N/A')}")
+    logging.info(f"  Shuffle buffer:        {cfg.get('shuffle_buffer_size', 'N/A')}")
+    logging.info("")
+
+    logging.info("  --- Model ---")
+    logging.info(f"  PaliGemma variant:     {cfg.get('paligemma_variant', 'N/A')}")
+    if mode == "ae":
+        logging.info(f"  Action expert variant: {cfg.get('action_expert_variant', 'N/A')}")
+    logging.info(f"  Action dim:            {cfg.get('model_action_dim', 'N/A')}")
+    logging.info(f"  Proprio dim:           {cfg.get('model_proprio_dim', 'N/A')}")
+    logging.info(f"  Horizon steps:         {cfg.get('horizon_steps', 'N/A')}")
+    logging.info(f"  Max token len:         {cfg.get('max_token_len', 'N/A')}")
+    logging.info(f"  Pretrained weights:    {cfg.get('pretrained_weight_path', 'NONE')}")
+    logging.info(f"  LoRA enabled:          {cfg.get('lora_enabled', False)}")
+    if cfg.get("lora_enabled", False):
+        logging.info(f"  LoRA rank:             {cfg.get('lora_rank', 16)}")
+        logging.info(f"  LoRA alpha:            {cfg.get('lora_alpha', 16.0)}")
+    logging.info("")
+
+    logging.info("  --- Training ---")
+    logging.info(f"  Batch size (per GPU):  {batch_size}")
+    logging.info(f"  Effective batch size:  {effective_batch}  ({batch_size} x {world_size} GPUs)")
+    logging.info(f"  Num train steps:       {num_steps}")
+    logging.info(f"  Total samples:         {total_samples:,}  (~{total_samples/1e6:.2f}M)")
+    logging.info(f"  Warmup steps:          {cfg.get('warmup_steps', 500)}")
+    logging.info(f"  Peak LR:               {cfg.get('peak_lr', 5e-5)}")
+    logging.info(f"  End LR:                {cfg.get('end_lr', 1e-6)}")
+    logging.info(f"  LR schedule:           cosine decay")
+    logging.info("")
+
+    logging.info("  --- Checkpointing ---")
+    logging.info(f"  Checkpoint dir:        {cfg.get('checkpoint_dir', 'N/A')}")
+    logging.info(f"  Save interval:         {cfg.get('save_interval', 1000)} steps")
+    logging.info(f"  Log interval:          {cfg.get('log_interval', 50)} steps")
+    logging.info(f"  Resume:                {cfg.get('resume', False)}")
+    logging.info(f"  W&B enabled:           {cfg.get('wandb_enabled', True)}")
+    logging.info(f"  Experiment name:       {cfg.get('exp_name', 'N/A')}")
+    logging.info(sep)
+
+
 def main():
     init_logging()
     parser = argparse.ArgumentParser()
@@ -522,6 +650,9 @@ def main():
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--resume", action="store_true", default=False)
     args = parser.parse_args()
+
+    logging.info(f"Config file: {os.path.abspath(args.config)}")
+    logging.info(f"Training mode: {args.mode}")
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
@@ -531,6 +662,10 @@ def main():
 
     use_ddp, local_rank, device = setup_ddp()
     is_main = not use_ddp or dist.get_rank() == 0
+
+    if is_main:
+        log_gpu_info(device)
+        log_training_config(cfg, args.mode, device, use_ddp)
 
     if args.mode == "ae":
         train_ae(cfg, device, use_ddp, is_main)
