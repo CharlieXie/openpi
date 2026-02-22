@@ -5,8 +5,8 @@ robot_type: libero
 task_suite: libero_object
 
 # Model checkpoints (set these to your trained checkpoint directories)
-vlm_checkpoint: checkpoints/waypoint_vlm_libero/30000
-ae_checkpoint: checkpoints/waypoint_ae_libero/30000
+vlm_checkpoint: /workspace/models/vlm
+ae_checkpoint: /workspace/models/action_expert
 
 # Data / normalization
 dataset_statistics_path: /workspace/data/libero_object_no_noops/1.0.0
@@ -21,6 +21,7 @@ max_token_len: 256
 # Model architecture
 paligemma_variant: gemma_2b
 action_expert_variant: gemma_300m
+precision: bfloat16
 
 # Normalization
 norm_type: q99
@@ -28,3 +29,6 @@ norm_type: q99
 # Evaluation
 num_trials_per_task: 3
 num_steps_wait: 10
+
+# Video output
+video_out_path: data/libero/videos_wp

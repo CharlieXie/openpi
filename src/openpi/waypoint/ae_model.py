@@ -270,6 +270,12 @@ class PI0WaypointAE(nn.Module):
         prefix_att_4d = prefix_att_2d[:, None, :, :]
         prefix_att_4d = torch.where(prefix_att_4d, 0.0, -2.3819763e38)
 
+        model_dtype = self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+        if prefix_embs.dtype != model_dtype:
+            prefix_embs = prefix_embs.to(model_dtype)
+        if prefix_att_4d.dtype != model_dtype:
+            prefix_att_4d = prefix_att_4d.to(model_dtype)
+
         _, past_kv = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_4d,
             position_ids=prefix_pos,
@@ -297,12 +303,14 @@ class PI0WaypointAE(nn.Module):
             full_att = torch.cat([prefix_2d, suffix_att_2d], dim=2)
             full_att_4d = full_att[:, None, :, :]
             full_att_4d = torch.where(full_att_4d, 0.0, -2.3819763e38)
+            if full_att_4d.dtype != model_dtype:
+                full_att_4d = full_att_4d.to(model_dtype)
 
             prefix_offsets = torch.sum(prefix_pad, dim=-1)[:, None]
             position_ids = prefix_offsets + torch.cumsum(suffix_pad, dim=1) - 1
 
-            if suffix_embs.dtype != torch.bfloat16:
-                suffix_embs = suffix_embs.to(torch.bfloat16)
+            if suffix_embs.dtype != model_dtype:
+                suffix_embs = suffix_embs.to(model_dtype)
 
             outputs, _ = self.paligemma_with_expert.forward(
                 attention_mask=full_att_4d,

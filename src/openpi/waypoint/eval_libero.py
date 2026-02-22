@@ -13,14 +13,24 @@ Usage:
 import argparse
 import logging
 import os
+import pathlib
 import time
 from pathlib import Path
 
+import imageio
 import numpy as np
 import safetensors.torch
 import torch
 import yaml
 from PIL import Image
+
+try:
+    import numpy.core.multiarray
+    torch.serialization.add_safe_globals([numpy.core.multiarray._reconstruct])
+    torch.serialization.add_safe_globals([np.ndarray])
+    torch.serialization.add_safe_globals([np.dtype])
+except Exception:
+    pass
 
 from openpi.waypoint.normalize import (
     NormalizationHelper,
@@ -84,7 +94,11 @@ def get_libero_images(env, obs, size=224):
 # ---------------------------------------------------------------------------
 
 def load_vlm(cfg, device):
-    """Load VLM waypoint predictor from checkpoint."""
+    """Load VLM waypoint predictor from checkpoint.
+
+    Handles checkpoints saved from PI0WaypointAE structure by remapping
+    paligemma_with_expert.paligemma.* -> paligemma.* keys.
+    """
     from openpi.waypoint.vlm_model import PI0WaypointVLM
     import openpi.models.pi0_config as pi0_config
 
@@ -98,8 +112,35 @@ def load_vlm(cfg, device):
 
     ckpt_path = cfg["vlm_checkpoint"]
     logger.info(f"Loading VLM from {ckpt_path}")
-    safetensors.torch.load_model(model, os.path.join(ckpt_path, "model.safetensors"))
+    ckpt_file = os.path.join(ckpt_path, "model.safetensors")
+    state_dict = safetensors.torch.load_file(ckpt_file, device="cpu")
 
+    has_pg_direct = any(k.startswith("paligemma.") for k in state_dict)
+    has_pg_nested = any(k.startswith("paligemma_with_expert.paligemma.") for k in state_dict)
+
+    if has_pg_direct:
+        safetensors.torch.load_model(model, ckpt_file)
+    elif has_pg_nested:
+        PREFIX = "paligemma_with_expert.paligemma."
+        remapped = {}
+        for k, v in state_dict.items():
+            if k.startswith(PREFIX):
+                new_key = "paligemma." + k[len(PREFIX):]
+                remapped[new_key] = v
+        own_state = model.state_dict()
+        loaded, skipped = 0, 0
+        for k, v in remapped.items():
+            if k in own_state and own_state[k].shape == v.shape:
+                own_state[k].copy_(v)
+                loaded += 1
+            else:
+                skipped += 1
+        model.load_state_dict(own_state, strict=False)
+        logger.info(f"VLM: loaded {loaded} params, skipped {skipped} (remapped from AE checkpoint)")
+    else:
+        raise ValueError(f"Cannot find PaliGemma weights in checkpoint: {ckpt_file}")
+
+    del state_dict
     return model.to(device).eval()
 
 
@@ -115,7 +156,7 @@ def load_ae(cfg, device):
         max_token_len=cfg.get("max_token_len", 64),
         paligemma_variant=cfg.get("paligemma_variant", "gemma_2b"),
         action_expert_variant=cfg.get("action_expert_variant", "gemma_300m"),
-        dtype="float32",
+        dtype=cfg.get("precision", "bfloat16"),
     )
     model = PI0WaypointAE(model_cfg)
 
@@ -173,13 +214,14 @@ def predict_actions(ae_model, images, instruction, start_wp, end_wp, duration, d
     img_tensors = {}
     img_masks = {}
     for key, arr in images.items():
-        t = torch.from_numpy(arr).float() / 127.5 - 1.0
-        img_tensors[key] = t.unsqueeze(0).to(device)
+        t = torch.from_numpy(arr).float() / 127.5 - 1.0  # (H, W, C)
+        t = t.permute(2, 0, 1)  # -> (C, H, W)
+        img_tensors[key] = t.unsqueeze(0).to(device)  # (1, C, H, W)
         img_masks[key] = torch.ones(1, dtype=torch.bool, device=device)
 
     for model_key in ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"]:
         if model_key not in img_tensors:
-            img_tensors[model_key] = torch.zeros(1, 224, 224, 3, device=device)
+            img_tensors[model_key] = torch.zeros(1, 3, 224, 224, device=device)
             img_masks[model_key] = torch.zeros(1, dtype=torch.bool, device=device)
 
     path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
@@ -227,7 +269,12 @@ def run_episode(
     vlm, ae_model, wp_tokenizer, norm_helper,
     env, initial_state, task_desc, cfg, device,
 ):
-    """Run one LIBERO episode with the two-stage waypoint pipeline."""
+    """Run one LIBERO episode with the two-stage waypoint pipeline.
+
+    Returns:
+        success: bool
+        replay_images: list of uint8 numpy images for video recording
+    """
     env.reset()
     obs = env.set_init_state(initial_state)
 
@@ -239,16 +286,21 @@ def run_episode(
 
     t = 0
     done = False
-    replay = []
+    reward = 0.0
+    replay_images = []
 
     dummy_action = np.zeros(7)
     while t < num_steps_wait:
         obs, _, done, _ = env.step(dummy_action)
         t += 1
         if done:
-            return True, replay
+            return True, replay_images
 
     while t < max_steps + num_steps_wait and not done:
+        agentview = obs.get("agentview_image", obs.get("agentview_rgb"))
+        if agentview is not None:
+            replay_images.append(np.ascontiguousarray(agentview[::-1, ::-1]))
+
         images = get_libero_images(env, obs)
         proprio_raw = get_proprio_from_obs(obs)
         proprio_norm = norm_helper.normalize_proprio(proprio_raw)
@@ -284,14 +336,17 @@ def run_episode(
 
                 obs, reward, done, info = env.step(action_raw)
                 t += 1
-                replay.append({"obs": obs, "action": action_raw})
+
+                agentview = obs.get("agentview_image", obs.get("agentview_rgb"))
+                if agentview is not None:
+                    replay_images.append(np.ascontiguousarray(agentview[::-1, ::-1]))
 
                 if done:
                     break
 
             start_wp = end_wp.copy()
 
-    return done and reward > 0, replay
+    return done and reward > 0, replay_images
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +369,9 @@ def evaluate(cfg):
         max_token_len=cfg.get("max_token_len", 256),
     )
 
+    video_out_path = pathlib.Path(cfg.get("video_out_path", "data/libero/videos"))
+    video_out_path.mkdir(parents=True, exist_ok=True)
+
     from libero.libero import benchmark
 
     task_suite_name = cfg.get("task_suite", "libero_object")
@@ -332,9 +390,7 @@ def evaluate(cfg):
         initial_states = bm.get_task_init_states(task_idx)
 
         env_args = {
-            "bddl_file_name": os.path.join(
-                bm.get_task_bddl_file_path(task_idx),
-            ),
+            "bddl_file_name": bm.get_task_bddl_file_path(task_idx),
             "camera_heights": 256,
             "camera_widths": 256,
         }
@@ -346,7 +402,7 @@ def evaluate(cfg):
         successes = 0
         for trial in range(min(num_trials, len(initial_states))):
             logger.info(f"Task {task_idx}/{num_tasks}: {task_name} trial {trial}")
-            success, replay = run_episode(
+            success, replay_images = run_episode(
                 vlm, ae_model, wp_tokenizer, norm_helper,
                 env, initial_states[trial], task_desc, cfg, device,
             )
@@ -354,7 +410,19 @@ def evaluate(cfg):
                 successes += 1
                 total_success += 1
             total_episodes += 1
-            logger.info(f"  -> {'SUCCESS' if success else 'FAIL'}")
+
+            suffix = "success" if success else "failure"
+            task_segment = task_desc.replace(" ", "_")
+            if replay_images:
+                video_file = video_out_path / f"rollout_{task_segment}_t{trial}_{suffix}.mp4"
+                imageio.mimwrite(
+                    str(video_file),
+                    [np.asarray(x) for x in replay_images],
+                    fps=10,
+                )
+                logger.info(f"  -> {suffix.upper()} (video: {video_file})")
+            else:
+                logger.info(f"  -> {suffix.upper()}")
 
         results[task_name] = {
             "success_rate": successes / min(num_trials, len(initial_states)),

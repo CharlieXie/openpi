@@ -1,6 +1,6 @@
 # Waypoint VLA — openpi 实现设计文档
 
-> 最后更新: 2026-02-21 (rev 3 — VLM finetune 验证通过)
+> 最后更新: 2026-02-22 (rev 4 — LIBERO 评测管线完善)
 > 基于 Pi0.5 (PyTorch) 在 openpi 项目中实现两段式 Waypoint VLA 系统
 
 ---
@@ -361,8 +361,28 @@ VLM 和 AE 都需要 q99 归一化统计量。如需从 waypoint-filtered RLDS �
 ### 评测
 
 ```bash
-python -m openpi.waypoint.eval_libero \
-  --config configs/eval_waypoint_libero.yaml
+# 安装评测依赖（训练环境中不包含 LIBERO 仿真）
+uv pip install --python .venv/bin/python \
+    robosuite==1.4.1 transforms3d bddl easydict "gym==0.26.2"
+uv pip install --python .venv/bin/python -e third_party/libero
+
+# 修复 LIBERO torch.load 兼容性（PyTorch 2.6+ weights_only 默认值变更）
+sed -i 's/init_states = torch.load(init_states_path)/init_states = torch.load(init_states_path, weights_only=False)/' \
+    third_party/libero/libero/libero/benchmark/__init__.py
+
+# 运行评测（单 GPU，需 ~20 GB 显存）
+MUJOCO_GL=egl \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+PYTHONPATH=$PWD/third_party/libero:$PYTHONPATH \
+.venv/bin/python -m openpi.waypoint.eval_libero \
+    --config configs/eval_waypoint_libero.yaml
+```
+
+评测配置（`configs/eval_waypoint_libero.yaml`）中需设置正确的 checkpoint 路径和 video 输出路径：
+```yaml
+vlm_checkpoint: /path/to/vlm/checkpoint_dir    # 须含 model.safetensors
+ae_checkpoint: /path/to/ae/checkpoint_dir
+video_out_path: data/libero/videos_wp           # 每个 episode 保存回放视频
 ```
 
 ---
@@ -483,6 +503,30 @@ Project: `waypoint_vla`
 
 ### torchrun 路径
 - 必须使用 `.venv/bin/torchrun`，系统 `torchrun`（`/venv/main/bin/torchrun`）会用错误的 Python 解释器，导致 `ModuleNotFoundError: No module named 'safetensors'`
+
+### 评测 — VLM Checkpoint 格式兼容
+- VLM 评测模型为 `PI0WaypointVLM`（仅 PaliGemma），key 前缀为 `paligemma.*`
+- 但 `train_waypoint.py` 保存 VLM checkpoint 时可能使用了完整 AE 模型结构（key 前缀为 `paligemma_with_expert.paligemma.*`）
+- `eval_libero.py` 的 `load_vlm()` 自动检测并 remap：`paligemma_with_expert.paligemma.X` → `paligemma.X`
+
+### 评测 — AE bfloat16 dtype 对齐
+- AE 以 bfloat16 加载（节省显存），但 attention mask 默认 float32
+- `ae_model.py` 的 `sample_actions()` 中已添加自动 dtype 对齐：`prefix_att_4d = prefix_att_4d.to(model_dtype)`
+- 不对齐会导致 SDPA 报 `RuntimeError: invalid dtype for bias`
+
+### 评测 — 图像格式
+- VLM 推理：图像以 BHWC 传入，`vlm_model.py` 内部 permute 为 BCHW
+- AE 推理：图像**必须以 BCHW 传入**，经 `preprocessing_pytorch.py` 处理后保持 BCHW
+- `eval_libero.py` 中 `predict_actions()` 对图像执行 `permute(2, 0, 1)` 转为 CHW
+
+### 评测 — 视频录制
+- 每个 episode 录制 agentview 相机的 256×256 图像（180° 旋转与训练一致）
+- 使用 `imageio.mimwrite()` 保存为 MP4，10 FPS
+- 文件名格式：`rollout_{task_name}_t{trial}_{success|failure}.mp4`
+
+### 评测 — GPU 显存
+- VLM (float32) ~11.7 GB + AE (bfloat16) ~7.5 GB ≈ **19.2 GB**
+- 单张 RTX 4090 (24 GB) 可运行；两个模型同时在 GPU 上，无需 swap
 
 ---
 
