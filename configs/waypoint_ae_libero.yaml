@@ -48,6 +48,10 @@ end_lr: 1.0e-8
 # Normalization
 norm_type: q99
 
+# Image augmentation — AE augmentation is applied in preprocessing_pytorch.py (train=True):
+#   non-wrist: random crop (0.95 scale) + random rotation (±5°) + color jitter
+#   all cameras: brightness (0.7-1.3), contrast (0.6-1.4), saturation (0.5-1.5)
+
 # Shuffle
 shuffle_buffer_size: 1000
 

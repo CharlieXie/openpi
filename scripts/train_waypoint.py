@@ -388,6 +388,8 @@ def train_vlm(cfg, device, use_ddp, is_main):
         num_waypoints=cfg.get("num_waypoints", 7),
         stride=cfg.get("stride", 4),
         shuffle_buffer_size=cfg.get("shuffle_buffer_size", 5000),
+        image_aug=cfg.get("image_aug", False),
+        image_aug_cfg=cfg.get("image_aug_cfg", None),
     )
     collator = WaypointVLMCollator()
     loader = torch.utils.data.DataLoader(

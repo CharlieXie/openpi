@@ -15,29 +15,38 @@ precision: bfloat16
 # Waypoint config
 num_waypoints: 7
 max_token_len: 256
-stride: 4
+stride: 1
 
 # Pretrained weights (Pi0.5 base — will extract PaliGemma portion)
 pretrained_weight_path: /workspace/models/pi05_base_pytorch
 
 # Training hyperparameters
-batch_size: 12
-num_train_steps: 30000
-warmup_steps: 500
-peak_lr: 5.0e-5
+batch_size: 320
+num_train_steps: 2000
+warmup_steps: 40
+peak_lr: 3.0e-5
 end_lr: 1.0e-7
 
 # Normalization
 norm_type: q99
 
+# Image augmentation (matching galaxea_0 reference defaults)
+image_aug: true
+image_aug_cfg:
+  random_resized_crop_scale: [0.9, 1.0]
+  brightness: 0.2
+  contrast: [0.8, 1.2]
+  saturation: [0.8, 1.2]
+  hue: 0.05
+
 # Shuffle
 shuffle_buffer_size: 5000
 
 # Logging and checkpointing
-exp_name: waypoint_vlm_libero_new1
-checkpoint_dir: checkpoints/waypoint_vlm_libero_new1
-save_interval: 50
-log_interval: 10
+exp_name: waypoint_vlm_libero_fix1
+checkpoint_dir: checkpoints/waypoint_vlm_libero_fix1
+save_interval: 200
+log_interval: 5
 wandb_enabled: true
 
 # LoRA (set to true for low-memory training)

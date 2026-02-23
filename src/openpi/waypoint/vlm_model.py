@@ -61,6 +61,19 @@ class PI0WaypointVLM(nn.Module):
         self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
         self.gradient_checkpointing_enabled = False
 
+        precision = getattr(config, "dtype", "float32")
+        if precision == "bfloat16":
+            self.paligemma.to(dtype=torch.bfloat16)
+            _float32_selectors = [
+                "patch_embedding.weight", "patch_embedding.bias",
+                "position_embedding.weight",
+                "input_layernorm", "post_attention_layernorm",
+                "model.norm",
+            ]
+            for name, param in self.paligemma.named_parameters():
+                if any(s in name for s in _float32_selectors):
+                    param.data = param.data.to(torch.float32)
+
     def gradient_checkpointing_enable(self):
         self.gradient_checkpointing_enabled = True
         self.paligemma.gradient_checkpointing_enable(
@@ -149,8 +162,11 @@ class PI0WaypointVLM(nn.Module):
         att_4d = att_2d[:, None, :, :]
         att_4d = torch.where(att_4d, 0.0, -2.3819763e38)
 
-        if all_embs.dtype != self.paligemma.language_model.embed_tokens.weight.dtype:
-            all_embs = all_embs.to(self.paligemma.language_model.embed_tokens.weight.dtype)
+        model_dtype = self.paligemma.language_model.embed_tokens.weight.dtype
+        if all_embs.dtype != model_dtype:
+            all_embs = all_embs.to(model_dtype)
+        if att_4d.dtype != model_dtype:
+            att_4d = att_4d.to(model_dtype)
 
         outputs = self.paligemma.language_model.forward(
             inputs_embeds=all_embs[:, :-1],
@@ -161,9 +177,6 @@ class PI0WaypointVLM(nn.Module):
 
         hidden = outputs.last_hidden_state
 
-        lm_head_weight = self.paligemma.language_model.embed_tokens.weight
-        logits = F.linear(hidden.float(), lm_head_weight.float())
-
         targets = torch.cat([
             torch.zeros(B, n_img_total, dtype=torch.long, device=device),
             tokens,
@@ -171,11 +184,15 @@ class PI0WaypointVLM(nn.Module):
 
         shift_loss_mask = full_loss_mask[:, 1:]
 
-        log_probs = F.log_softmax(logits, dim=-1)
-        target_log_probs = log_probs.gather(2, targets.unsqueeze(-1)).squeeze(-1)
-
-        masked_nll = -target_log_probs * shift_loss_mask.float()
-        loss = masked_nll.sum() / shift_loss_mask.float().sum().clamp(min=1)
+        lm_head_weight = self.paligemma.language_model.embed_tokens.weight
+        mask = shift_loss_mask
+        if mask.any():
+            active_hidden = hidden[mask]
+            active_targets = targets[mask]
+            active_logits = F.linear(active_hidden.float(), lm_head_weight.float())
+            loss = F.cross_entropy(active_logits, active_targets)
+        else:
+            loss = torch.tensor(0.0, device=device, requires_grad=True)
 
         return loss
 
@@ -233,8 +250,11 @@ class PI0WaypointVLM(nn.Module):
         prefix_att_4d = prefix_att_padded[:, None, :, :]
         prefix_att_4d = torch.where(prefix_att_4d, 0.0, -2.3819763e38)
 
-        if prefix_embs.dtype != self.paligemma.language_model.embed_tokens.weight.dtype:
-            prefix_embs = prefix_embs.to(self.paligemma.language_model.embed_tokens.weight.dtype)
+        model_dtype = self.paligemma.language_model.embed_tokens.weight.dtype
+        if prefix_embs.dtype != model_dtype:
+            prefix_embs = prefix_embs.to(model_dtype)
+        if prefix_att_4d.dtype != model_dtype:
+            prefix_att_4d = prefix_att_4d.to(model_dtype)
 
         outputs = self.paligemma.language_model.forward(
             inputs_embeds=prefix_embs,
@@ -291,7 +311,7 @@ class PI0WaypointVLM(nn.Module):
 
             positions = prefill_len[:, None] + step
             attn_len = prefix_len + step + 1
-            mask = torch.ones(B, 1, 1, attn_len, device=device) * 0.0
+            mask = torch.zeros(B, 1, 1, attn_len, device=device, dtype=model_dtype)
 
             outputs = self.paligemma.language_model.forward(
                 inputs_embeds=token_emb,

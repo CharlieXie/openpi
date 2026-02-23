@@ -285,8 +285,11 @@ loss = sum(loss_per_element) / num_valid_elements
 #   图像 token + 语言 token: bidirectional (ar_mask=0)
 #   waypoint tokens:         causal (ar_mask=1)
 
-logits = paligemma_lm_head(transformer_output[:-1])  # predict next token
-loss = CE(logits, targets[1:], mask=loss_mask[1:])
+# Masked logits: 只对 loss_mask=True 的位置计算 LM head + CE loss
+# 有效 tokens 仅 ~63 (7 WP × 9)，全序列 ~768，节省 ~90% logits 内存
+active_hidden = hidden[shift_loss_mask]        # [N_valid, 2048]
+active_logits = lm_head(active_hidden.float()) # [N_valid, vocab_size]
+loss = F.cross_entropy(active_logits, active_targets)
 ```
 
 ### 推理 (Constrained Decoding)
@@ -547,12 +550,17 @@ Project: `waypoint_vla`
 
 ### VLM
 
-VLM 全量 finetune PaliGemma 2B，内存占用显著高于 AE（因优化器状态和更长的序列）。
+VLM 全量 finetune PaliGemma 2B。v2 优化后内存占用大幅降低。
 需要 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 避免 CUDA 内存碎片化。
+
+**v2 优化 (三项合计节省 ~60 GB per GPU):**
+1. **Masked logits**: 只对 loss_mask=True 的位置 (~63 tokens) 计算 LM head，不再对全序列 (~768) 计算 → 节省 ~40 GB
+2. **bfloat16**: config `precision: bfloat16` 现在生效，模型参数+优化器状态减半 → 节省 ~20 GB
+3. **跳过 dummy image**: LIBERO 只有 2 个 camera，不再处理全零的第 3 张图 → 节省 ~2 GB + 序列缩短 25%
 
 | batch_size (per GPU) | 实测 GPU 内存 | 有效总 batch | 备注 |
 |----------------------|--------------|-------------|------|
-| 4 | ~48 GB | 8 | 单卡调试可用 |
-| 12 | ~91-93 GB | 24 | **DDP 推荐** — 两卡均有 ~3-5 GB 余量 |
-| 16 | ~93-94 GB | 32 | 单卡勉强可用，DDP OOM（DDP 额外开销） |
-| 32 | OOM | — | 需 LoRA 或梯度累积 |
+| 4 | ~48 GB | 8 | 单卡调试可用 (v1 float32) |
+| 12 | ~91-93 GB | 24 | v1 DDP 极限 (float32 + 全序列 logits) |
+| 14 | ~93 GB | 28 | v1 DDP 极限 |
+| 32+ | 待测 | 64+ | **v2 优化后预期可行** — 需重新 profiling |

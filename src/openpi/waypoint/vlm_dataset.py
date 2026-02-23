@@ -14,12 +14,41 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import IterableDataset
+from torchvision import transforms as T
 
 from openpi.waypoint.normalize import NormalizationHelper, extract_proprio_from_obs, pad_to_dim
 from openpi.waypoint.robot_config import RobotConfig
 from openpi.waypoint.tokenizer import WaypointTokenizer
 
 logger = logging.getLogger(__name__)
+
+
+def build_image_augmentation(aug_cfg: dict | None = None) -> T.Compose:
+    """Build a torchvision augmentation pipeline from config.
+
+    Default parameters match the galaxea_0 reference:
+      brightness=0.2, contrast=[0.8,1.2], saturation=[0.8,1.2], hue=0.05,
+      random_resized_crop scale=[0.9,1.0].
+    """
+    if aug_cfg is None:
+        aug_cfg = {}
+
+    crop_scale = tuple(aug_cfg.get("random_resized_crop_scale", [0.9, 1.0]))
+    brightness = aug_cfg.get("brightness", 0.2)
+    contrast = tuple(aug_cfg.get("contrast", [0.8, 1.2]))
+    saturation = tuple(aug_cfg.get("saturation", [0.8, 1.2]))
+    hue = aug_cfg.get("hue", 0.05)
+
+    tfms = [
+        T.RandomResizedCrop(224, scale=crop_scale, ratio=(1.0, 1.0), antialias=True),
+        T.ColorJitter(
+            brightness=brightness,
+            contrast=contrast,
+            saturation=saturation,
+            hue=hue,
+        ),
+    ]
+    return T.Compose(tfms)
 
 
 class WaypointVLMDataset(IterableDataset):
@@ -41,6 +70,8 @@ class WaypointVLMDataset(IterableDataset):
         stride: int = 1,
         image_size: tuple[int, int] = (224, 224),
         shuffle_buffer_size: int = 5000,
+        image_aug: bool = False,
+        image_aug_cfg: dict | None = None,
     ):
         super().__init__()
         self.wp_rlds_dir = wp_rlds_dir
@@ -54,9 +85,14 @@ class WaypointVLMDataset(IterableDataset):
 
         self.norm_helper = NormalizationHelper(dataset_statistics, norm_type)
 
+        self.image_aug_transform = None
+        if image_aug:
+            self.image_aug_transform = build_image_augmentation(image_aug_cfg)
+            logger.info(f"Image augmentation enabled: {self.image_aug_transform}")
+
         logger.info(
             f"WaypointVLMDataset: dir={wp_rlds_dir}, M={num_waypoints}, stride={stride}, "
-            f"robot={robot_config.robot_type}"
+            f"robot={robot_config.robot_type}, image_aug={image_aug}"
         )
 
     def _raw_sample_iter(self):
@@ -151,13 +187,10 @@ class WaypointVLMDataset(IterableDataset):
                         img = Image.fromarray(img_data)
                         if img.size != self.image_size:
                             img = img.resize(self.image_size, Image.BILINEAR)
+                        if self.image_aug_transform is not None:
+                            img = self.image_aug_transform(img)
                         images[model_key] = np.array(img, dtype=np.uint8)
                         image_masks[model_key] = True
-
-                    for model_key in ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"]:
-                        if model_key not in images:
-                            images[model_key] = np.zeros((*self.image_size, 3), dtype=np.uint8)
-                            image_masks[model_key] = False
 
                     tokens, token_mask, ar_mask, loss_mask = self.wp_tokenizer.tokenize(
                         prompt=instruction,
@@ -201,7 +234,8 @@ class WaypointVLMCollator:
 
         all_images = {}
         all_image_masks = {}
-        for key in ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"]:
+        image_keys = sorted(batch[0]["images"].keys())
+        for key in image_keys:
             imgs = np.stack([s["images"][key] for s in batch])  # (B, H, W, C)
             imgs = imgs.astype(np.float32) / 127.5 - 1.0
             imgs = imgs.transpose(0, 3, 1, 2)  # (B, C, H, W)
