@@ -371,10 +371,11 @@ sed -i 's/init_states = torch.load(init_states_path)/init_states = torch.load(in
     third_party/libero/libero/libero/benchmark/__init__.py
 
 # 运行评测（单 GPU，需 ~20 GB 显存）
-MUJOCO_GL=egl \
+MUJOCO_GL=osmesa \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 PYTHONPATH=$PWD/third_party/libero:$PYTHONPATH \
-.venv/bin/python -m openpi.waypoint.eval_libero \
+PYTHONFAULTHANDLER=1 \
+.venv/bin/python -u -m openpi.waypoint.eval_libero \
     --config configs/eval_waypoint_libero.yaml
 ```
 

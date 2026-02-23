@@ -10,9 +10,13 @@ Usage:
   python -m openpi.waypoint.eval_libero --config configs/eval_waypoint_libero.yaml
 """
 
-import argparse
-import logging
 import os
+os.environ["NUMBA_DISABLE_JIT"] = "1"
+
+import argparse
+import contextlib
+import json
+import logging
 import pathlib
 import time
 from pathlib import Path
@@ -93,6 +97,30 @@ def get_libero_images(env, obs, size=224):
 # Model loading
 # ---------------------------------------------------------------------------
 
+@contextlib.contextmanager
+def skip_init_weights():
+    """Bypass random weight initialization when loading from checkpoint.
+
+    Saves ~30-60s for large models (3B+ params) by replacing torch.nn.init
+    functions with no-ops. Safe when all weights are overwritten by a checkpoint.
+    """
+    saved = {}
+    _noop = lambda x, *a, **kw: x
+    for name in (
+        "kaiming_uniform_", "kaiming_normal_", "xavier_uniform_", "xavier_normal_",
+        "uniform_", "normal_", "zeros_", "ones_", "constant_", "orthogonal_",
+        "trunc_normal_",
+    ):
+        if hasattr(torch.nn.init, name):
+            saved[name] = getattr(torch.nn.init, name)
+            setattr(torch.nn.init, name, _noop)
+    try:
+        yield
+    finally:
+        for name, fn in saved.items():
+            setattr(torch.nn.init, name, fn)
+
+
 def load_vlm(cfg, device):
     """Load VLM waypoint predictor from checkpoint.
 
@@ -102,26 +130,36 @@ def load_vlm(cfg, device):
     from openpi.waypoint.vlm_model import PI0WaypointVLM
     import openpi.models.pi0_config as pi0_config
 
+    t0 = time.time()
     model_cfg = pi0_config.Pi0Config(
         pi05=False,
         max_token_len=cfg.get("max_token_len", 256),
         paligemma_variant=cfg.get("paligemma_variant", "gemma_2b"),
         dtype="float32",
     )
-    model = PI0WaypointVLM(model_cfg)
+    with skip_init_weights():
+        model = PI0WaypointVLM(model_cfg)
+    logger.info(f"VLM model init: {time.time() - t0:.1f}s")
 
     ckpt_path = cfg["vlm_checkpoint"]
-    logger.info(f"Loading VLM from {ckpt_path}")
     ckpt_file = os.path.join(ckpt_path, "model.safetensors")
-    state_dict = safetensors.torch.load_file(ckpt_file, device="cpu")
+    logger.info(f"Loading VLM from {ckpt_path}")
 
-    has_pg_direct = any(k.startswith("paligemma.") for k in state_dict)
-    has_pg_nested = any(k.startswith("paligemma_with_expert.paligemma.") for k in state_dict)
+    # Read only the safetensors header (~91KB) to detect key format,
+    # instead of loading the entire checkpoint (~11GB) just to inspect keys.
+    with open(ckpt_file, "rb") as f:
+        header_size = int.from_bytes(f.read(8), "little")
+        header_keys = list(json.loads(f.read(header_size)).keys())
 
+    has_pg_direct = any(k.startswith("paligemma.") for k in header_keys)
+    has_pg_nested = any(k.startswith("paligemma_with_expert.paligemma.") for k in header_keys)
+
+    t0 = time.time()
     if has_pg_direct:
         safetensors.torch.load_model(model, ckpt_file)
     elif has_pg_nested:
         PREFIX = "paligemma_with_expert.paligemma."
+        state_dict = safetensors.torch.load_file(ckpt_file, device="cpu")
         remapped = {}
         for k, v in state_dict.items():
             if k.startswith(PREFIX):
@@ -136,12 +174,16 @@ def load_vlm(cfg, device):
             else:
                 skipped += 1
         model.load_state_dict(own_state, strict=False)
+        del state_dict
         logger.info(f"VLM: loaded {loaded} params, skipped {skipped} (remapped from AE checkpoint)")
     else:
         raise ValueError(f"Cannot find PaliGemma weights in checkpoint: {ckpt_file}")
+    logger.info(f"VLM weight load: {time.time() - t0:.1f}s")
 
-    del state_dict
-    return model.to(device).eval()
+    t0 = time.time()
+    model = model.to(device).eval()
+    logger.info(f"VLM to {device}: {time.time() - t0:.1f}s")
+    return model
 
 
 def load_ae(cfg, device):
@@ -149,6 +191,7 @@ def load_ae(cfg, device):
     from openpi.waypoint.ae_model import PI0WaypointAE
     import openpi.models.pi0_config as pi0_config
 
+    t0 = time.time()
     model_cfg = pi0_config.Pi0Config(
         pi05=True,
         action_dim=cfg.get("model_action_dim", 32),
@@ -158,13 +201,20 @@ def load_ae(cfg, device):
         action_expert_variant=cfg.get("action_expert_variant", "gemma_300m"),
         dtype=cfg.get("precision", "bfloat16"),
     )
-    model = PI0WaypointAE(model_cfg)
+    with skip_init_weights():
+        model = PI0WaypointAE(model_cfg)
+    logger.info(f"AE model init: {time.time() - t0:.1f}s")
 
     ckpt_path = cfg["ae_checkpoint"]
     logger.info(f"Loading Action Expert from {ckpt_path}")
+    t0 = time.time()
     safetensors.torch.load_model(model, os.path.join(ckpt_path, "model.safetensors"))
+    logger.info(f"AE weight load: {time.time() - t0:.1f}s")
 
-    return model.to(device).eval()
+    t0 = time.time()
+    model = model.to(device).eval()
+    logger.info(f"AE to {device}: {time.time() - t0:.1f}s")
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -205,12 +255,19 @@ def predict_waypoints(vlm, images, instruction, wp_tokenizer, state_norm, device
     return waypoints[0]
 
 
-@torch.no_grad()
-def predict_actions(ae_model, images, instruction, start_wp, end_wp, duration, device):
-    """Action Expert flow matching inference."""
+def load_pg_tokenizer():
+    """Load PaliGemma SentencePiece tokenizer (cached, call once)."""
     import sentencepiece
     import openpi.shared.download as download
 
+    path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+    with path.open("rb") as f:
+        return sentencepiece.SentencePieceProcessor(model_proto=f.read())
+
+
+@torch.no_grad()
+def predict_actions(ae_model, images, instruction, start_wp, end_wp, duration, device, pg_tok):
+    """Action Expert flow matching inference."""
     img_tensors = {}
     img_masks = {}
     for key, arr in images.items():
@@ -224,17 +281,13 @@ def predict_actions(ae_model, images, instruction, start_wp, end_wp, duration, d
             img_tensors[model_key] = torch.zeros(1, 3, 224, 224, device=device)
             img_masks[model_key] = torch.zeros(1, dtype=torch.bool, device=device)
 
-    path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
-    with path.open("rb") as f:
-        pg_tok = sentencepiece.SentencePieceProcessor(model_proto=f.read())
-
     text = f"Task: {instruction.strip().replace('_', ' ').lower()}, \n"
     tids = pg_tok.encode(text, add_bos=True)
     max_len = 64
-    if len(tids) < max_len:
-        tids = tids + [0] * (max_len - len(tids))
-        mask = [True] * len(tids[:max_len])
-        mask[len(pg_tok.encode(text, add_bos=True)):] = [False] * (max_len - len(pg_tok.encode(text, add_bos=True)))
+    tids_len = len(tids)
+    if tids_len < max_len:
+        tids = tids + [0] * (max_len - tids_len)
+        mask = [True] * tids_len + [False] * (max_len - tids_len)
     else:
         tids = tids[:max_len]
         mask = [True] * max_len
@@ -265,9 +318,18 @@ def predict_actions(ae_model, images, instruction, start_wp, end_wp, duration, d
 # Episode runner
 # ---------------------------------------------------------------------------
 
+def _fmt_array(a, n=4):
+    """Format first n elements of an array for logging."""
+    flat = np.asarray(a).flatten()
+    vals = " ".join(f"{v:.4f}" for v in flat[:n])
+    if len(flat) > n:
+        vals += " ..."
+    return f"[{vals}]"
+
+
 def run_episode(
     vlm, ae_model, wp_tokenizer, norm_helper,
-    env, initial_state, task_desc, cfg, device,
+    env, initial_state, task_desc, cfg, device, pg_tok,
 ):
     """Run one LIBERO episode with the two-stage waypoint pipeline.
 
@@ -288,6 +350,7 @@ def run_episode(
     done = False
     reward = 0.0
     replay_images = []
+    replan_count = 0
 
     dummy_action = np.zeros(7)
     while t < num_steps_wait:
@@ -306,14 +369,27 @@ def run_episode(
         proprio_norm = norm_helper.normalize_proprio(proprio_raw)
         state_padded = pad_to_dim(proprio_norm, model_proprio_dim)
 
+        t_vlm = time.time()
         waypoints = predict_waypoints(vlm, images, task_desc, wp_tokenizer, state_padded, device)
+        vlm_ms = (time.time() - t_vlm) * 1000
 
+        replan_count += 1
         if not waypoints:
+            logger.info(f"  [replan {replan_count}] VLM returned empty waypoints ({vlm_ms:.0f}ms), stopping")
             break
+
+        valid_wps = [(p, d) for p, d in waypoints if d > 0]
+        durations = [d for _, d in valid_wps]
+        logger.info(
+            f"  [replan {replan_count}] VLM: {len(waypoints)} waypoints, "
+            f"{len(valid_wps)} valid, durations={durations}, vlm_time={vlm_ms:.0f}ms"
+        )
+        for wi, (pv, dur) in enumerate(waypoints):
+            logger.info(f"    wp[{wi}]: proprio={_fmt_array(pv, 6)}, duration={dur}")
 
         start_wp = state_padded.copy()
 
-        for proprio_values, duration in waypoints:
+        for wp_idx, (proprio_values, duration) in enumerate(waypoints):
             if duration == 0:
                 break
             if done:
@@ -322,9 +398,18 @@ def run_episode(
             end_wp = pad_to_dim(proprio_values, model_proprio_dim)
 
             fresh_images = get_libero_images(env, obs)
-            actions_norm = predict_actions(ae_model, fresh_images, task_desc, start_wp, end_wp, duration, device)
+            t_ae = time.time()
+            actions_norm = predict_actions(
+                ae_model, fresh_images, task_desc, start_wp, end_wp, duration, device, pg_tok,
+            )
+            ae_ms = (time.time() - t_ae) * 1000
 
             num_execute = min(int(duration), actions_norm.shape[0])
+            logger.info(
+                f"    ae[{wp_idx}]: shape={actions_norm.shape}, execute={num_execute}, "
+                f"range=[{actions_norm.min():.3f}, {actions_norm.max():.3f}], ae_time={ae_ms:.0f}ms"
+            )
+
             for step_i in range(num_execute):
                 action_raw = norm_helper.unnormalize_actions(actions_norm[step_i, :actual_action_dim])
 
@@ -346,6 +431,7 @@ def run_episode(
 
             start_wp = end_wp.copy()
 
+    logger.info(f"  episode done: steps={t}, replans={replan_count}, success={done and reward > 0}")
     return done and reward > 0, replay_images
 
 
@@ -355,9 +441,16 @@ def run_episode(
 
 def evaluate(cfg):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Device: {device}")
 
+    t_total = time.time()
     vlm = load_vlm(cfg, device)
     ae_model = load_ae(cfg, device)
+    logger.info(f"Total model loading: {time.time() - t_total:.1f}s")
+
+    t0 = time.time()
+    pg_tok = load_pg_tokenizer()
+    logger.info(f"PaliGemma tokenizer loaded: {time.time() - t0:.1f}s")
 
     rc = get_robot_config("libero")
     stats = load_dataset_statistics(cfg["dataset_statistics_path"])
@@ -396,16 +489,20 @@ def evaluate(cfg):
         }
 
         from libero.libero.envs import OffScreenRenderEnv
+        t0 = time.time()
         env = OffScreenRenderEnv(**env_args)
         env.seed(0)
+        logger.info(f"Env init for task {task_idx}: {time.time() - t0:.1f}s")
 
         successes = 0
         for trial in range(min(num_trials, len(initial_states))):
+            t_ep = time.time()
             logger.info(f"Task {task_idx}/{num_tasks}: {task_name} trial {trial}")
             success, replay_images = run_episode(
                 vlm, ae_model, wp_tokenizer, norm_helper,
-                env, initial_states[trial], task_desc, cfg, device,
+                env, initial_states[trial], task_desc, cfg, device, pg_tok,
             )
+            ep_secs = time.time() - t_ep
             if success:
                 successes += 1
                 total_success += 1
@@ -420,9 +517,9 @@ def evaluate(cfg):
                     [np.asarray(x) for x in replay_images],
                     fps=10,
                 )
-                logger.info(f"  -> {suffix.upper()} (video: {video_file})")
+                logger.info(f"  -> {suffix.upper()} ({ep_secs:.1f}s, video: {video_file})")
             else:
-                logger.info(f"  -> {suffix.upper()}")
+                logger.info(f"  -> {suffix.upper()} ({ep_secs:.1f}s)")
 
         results[task_name] = {
             "success_rate": successes / min(num_trials, len(initial_states)),
@@ -436,6 +533,7 @@ def evaluate(cfg):
     logger.info(f"Overall success rate: {overall_rate:.2%} ({total_success}/{total_episodes})")
     for name, r in results.items():
         logger.info(f"  {name}: {r['success_rate']:.2%} ({r['successes']}/{r['trials']})")
+    logger.info(f"Total eval time: {time.time() - t_total:.1f}s")
 
     return results
 

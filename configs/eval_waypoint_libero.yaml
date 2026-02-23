@@ -5,8 +5,8 @@ robot_type: libero
 task_suite: libero_object
 
 # Model checkpoints (set these to your trained checkpoint directories)
-vlm_checkpoint: /workspace/openpi/checkpoints/waypoint_vlm_libero_new1/400
-ae_checkpoint: /workspace/openpi/checkpoints/waypoint_ae_libero_01/2400
+vlm_checkpoint: /workspace/models/vlm/12000
+ae_checkpoint: /workspace/models/ae/2400
 
 # Data / normalization
 dataset_statistics_path: /workspace/data/libero_object_no_noops/1.0.0

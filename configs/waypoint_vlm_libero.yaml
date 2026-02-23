@@ -15,7 +15,7 @@ precision: bfloat16
 # Waypoint config
 num_waypoints: 7
 max_token_len: 256
-stride: 4
+stride: 1
 
 # Pretrained weights (Pi0.5 base — will extract PaliGemma portion)
 pretrained_weight_path: /workspace/models/pi05_base_pytorch
