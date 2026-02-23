@@ -310,12 +310,6 @@ class PI0WaypointVLM(nn.Module):
 
         results = []
         for b in range(B):
-            wp_tokens_only = []
-            for t in all_output_tokens[b]:
-                if t not in (wp_tokenizer.wp_token_id, wp_tokenizer.dur_token_id) and t not in action_header:
-                    pass
-                wp_tokens_only.append(t)
-
             waypoints = wp_tokenizer.decode_waypoints(all_output_tokens[b])
             results.append(waypoints)
 

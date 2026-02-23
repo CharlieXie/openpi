@@ -112,9 +112,9 @@ class WaypointVLMDataset(IterableDataset):
                 if isinstance(instruction, bytes):
                     instruction = instruction.decode("utf-8")
 
-                for start_idx in range(0, num_steps, self.stride):
-                    end_idx = min(start_idx + M, num_steps)
-                    actual_wps = end_idx - start_idx
+                for start_idx in range(0, num_steps - 1, self.stride):
+                    end_idx = min(start_idx + 1 + M, num_steps)
+                    actual_wps = end_idx - start_idx - 1
                     if actual_wps < 1:
                         continue
 
@@ -124,20 +124,13 @@ class WaypointVLMDataset(IterableDataset):
                     wp_pad_mask_duration = np.ones(M, dtype=bool)
 
                     for j in range(actual_wps):
-                        wp_idx = start_idx + j
-                        wp_proprios[j] = all_proprios_norm[wp_idx]
+                        wp_proprios[j] = all_proprios_norm[start_idx + 1 + j]
                         wp_pad_mask_proprio[j] = False
+                        wp_durations[j] = all_durations[start_idx + j]
+                        wp_pad_mask_duration[j] = False
 
-                        if j > 0:
-                            wp_durations[j - 1] = all_durations[wp_idx - 1] if (wp_idx - 1) < len(all_durations) else 0
-                            wp_pad_mask_duration[j - 1] = False
-
-                    if actual_wps >= 1:
-                        if start_idx + actual_wps - 1 < len(all_durations):
-                            wp_durations[actual_wps - 1] = all_durations[start_idx + actual_wps - 1]
-                            wp_pad_mask_duration[actual_wps - 1] = False
-
-                    if all_is_end[min(start_idx + actual_wps - 1, num_steps - 1)]:
+                    last_wp_step = start_idx + actual_wps
+                    if all_is_end[min(last_wp_step, num_steps - 1)]:
                         if actual_wps < M:
                             wp_durations[actual_wps] = 0
                             wp_pad_mask_duration[actual_wps] = False

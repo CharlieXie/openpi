@@ -9,7 +9,7 @@ vlm_checkpoint: /workspace/models/vlm/12000
 ae_checkpoint: /workspace/models/ae/2400
 
 # Data / normalization
-dataset_statistics_path: /workspace/data/libero/libero_object_wp_001/norm_stats
+dataset_statistics_path: /workspace/data/libero_object_no_noops/1.0.0
 
 # Model dimensions
 model_action_dim: 32

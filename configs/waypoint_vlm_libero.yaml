@@ -5,7 +5,7 @@ robot_type: libero
 
 # Data paths
 wp_rlds_dir: /workspace/data/libero/libero_object_wp_001/waypoint_filtered_rlds__libero/1.0.0
-dataset_statistics_path: /workspace/data/libero/libero_object_wp_001/norm_stats
+dataset_statistics_path: /workspace/data/libero_object_no_noops/1.0.0
 
 # Model architecture
 paligemma_variant: gemma_2b
@@ -15,7 +15,7 @@ precision: bfloat16
 # Waypoint config
 num_waypoints: 7
 max_token_len: 256
-stride: 1
+stride: 4
 
 # Pretrained weights (Pi0.5 base — will extract PaliGemma portion)
 pretrained_weight_path: /workspace/models/pi05_base_pytorch

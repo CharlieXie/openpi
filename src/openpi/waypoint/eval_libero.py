@@ -236,8 +236,10 @@ def predict_waypoints(vlm, images, instruction, wp_tokenizer, state_norm, device
             img_tensors[model_key] = torch.zeros(1, 224, 224, 3, device=device)
             img_masks[model_key] = torch.zeros(1, dtype=torch.bool, device=device)
 
+    proprio_dim = wp_tokenizer.proprio_dim
+    state_for_prompt = state_norm[:proprio_dim]
     prompt_text = f"Task: {instruction.strip().replace('_', ' ').lower()}, State: "
-    discretized = np.digitize(np.clip(state_norm, -1, 1), np.linspace(-1, 1, 257)[:-1]) - 1
+    discretized = np.digitize(np.clip(state_for_prompt, -1, 1), np.linspace(-1, 1, 257)[:-1]) - 1
     prompt_text += " ".join(map(str, discretized.astype(int))) + ";\n"
 
     prompt_tokens_list = wp_tokenizer._pg_tokenizer.encode(prompt_text, add_bos=True)
@@ -387,12 +389,16 @@ def run_episode(
             logger.info(f"    wp[{wi}]: proprio={_fmt_array(pv, 6)}, duration={dur}")
 
         start_wp = state_padded.copy()
+        steps_this_cycle = 0
 
         for wp_idx, (proprio_values, duration) in enumerate(waypoints):
             if duration == 0:
                 break
             if done:
                 break
+            if duration < 0:
+                logger.warning(f"    wp[{wp_idx}]: negative duration {duration}, skipping")
+                continue
 
             end_wp = pad_to_dim(proprio_values, model_proprio_dim)
 
@@ -420,6 +426,7 @@ def run_episode(
 
                 obs, reward, done, info = env.step(action_raw)
                 t += 1
+                steps_this_cycle += 1
 
                 agentview = obs.get("agentview_image", obs.get("agentview_rgb"))
                 if agentview is not None:
@@ -429,6 +436,11 @@ def run_episode(
                     break
 
             start_wp = end_wp.copy()
+
+        if steps_this_cycle == 0 and not done:
+            logger.warning(f"  [replan {replan_count}] no actions executed, advancing with no-op")
+            obs, reward, done, info = env.step(np.zeros(actual_action_dim))
+            t += 1
 
     logger.info(f"  episode done: steps={t}, replans={replan_count}, success={done and reward > 0}")
     return done and reward > 0, replay_images
@@ -454,6 +466,8 @@ def evaluate(cfg):
     rc = get_robot_config("libero")
     stats = load_dataset_statistics(cfg["dataset_statistics_path"])
     norm_helper = NormalizationHelper(stats, cfg.get("norm_type", "q99"))
+    if rc.action_norm_mask is not None:
+        norm_helper.action_norm_mask = rc.action_norm_mask
 
     wp_tokenizer = WaypointTokenizer(
         proprio_dim=rc.actual_proprio_dim,
