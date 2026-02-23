@@ -34,9 +34,10 @@ class PI0WaypointAE(nn.Module):
     waypoint proprio conditioning and adds duration via AdaRMSNorm.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, aug_cfg: dict | None = None):
         super().__init__()
         self.config = config
+        self.aug_cfg = aug_cfg
         self.action_horizon = config.action_horizon
         self.action_dim = config.action_dim
         self.duration_max = getattr(config, "duration_max", DURATION_MAX)
@@ -180,7 +181,7 @@ class PI0WaypointAE(nn.Module):
             loss: scalar mean loss.
         """
         import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
-        obs = _preprocessing.preprocess_observation_pytorch(observation, train=True)
+        obs = _preprocessing.preprocess_observation_pytorch(observation, train=True, aug_cfg=self.aug_cfg)
         images = list(obs.images.values())
         img_masks = list(obs.image_masks.values())
         lang_tokens = obs.tokenized_prompt

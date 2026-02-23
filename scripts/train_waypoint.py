@@ -185,7 +185,7 @@ def train_ae(cfg, device, use_ddp, is_main):
         dtype=cfg.get("precision", "bfloat16"),
     )
 
-    model = PI0WaypointAE(model_cfg).to(device)
+    model = PI0WaypointAE(model_cfg, aug_cfg=cfg.get("image_aug_cfg", None)).to(device)
     model.gradient_checkpointing_enable()
     if is_main:
         log_gpu_memory(device, prefix="[After model init] ")

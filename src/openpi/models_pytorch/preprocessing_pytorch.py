@@ -21,6 +21,7 @@ def preprocess_observation_pytorch(
     observation,
     *,
     train: bool = False,
+    aug_cfg: dict | None = None,
     image_keys: Sequence[str] = IMAGE_KEYS,
     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
 ):
@@ -50,95 +51,75 @@ def preprocess_observation_pytorch(
             image = image_tools.resize_with_pad_torch(image, *image_resolution)
 
         if train:
+            _aug = aug_cfg or {}
+            crop_scale    = float(_aug.get("crop_scale", 0.95))
+            rotation_deg  = float(_aug.get("rotation_deg", 5.0))
+            brightness_lo = float(_aug.get("brightness_lo", 0.7))
+            brightness_hi = float(_aug.get("brightness_hi", 1.3))
+            contrast_lo   = float(_aug.get("contrast_lo", 0.6))
+            contrast_hi   = float(_aug.get("contrast_hi", 1.4))
+            saturation_lo = float(_aug.get("saturation_lo", 0.5))
+            saturation_hi = float(_aug.get("saturation_hi", 1.5))
+
             # Convert from [-1, 1] to [0, 1] for PyTorch augmentations
             image = image / 2.0 + 0.5
 
-            # Apply PyTorch-based augmentations
             if "wrist" not in key:
-                # Geometric augmentations for non-wrist cameras
                 height, width = image.shape[1:3]
 
-                # Random crop and resize
-                crop_height = int(height * 0.95)
-                crop_width = int(width * 0.95)
+                crop_height = int(height * crop_scale)
+                crop_width  = int(width  * crop_scale)
 
-                # Random crop
                 max_h = height - crop_height
-                max_w = width - crop_width
+                max_w = width  - crop_width
                 if max_h > 0 and max_w > 0:
-                    # Use tensor operations instead of .item() for torch.compile compatibility
                     start_h = torch.randint(0, max_h + 1, (1,), device=image.device)
                     start_w = torch.randint(0, max_w + 1, (1,), device=image.device)
                     image = image[:, start_h : start_h + crop_height, start_w : start_w + crop_width, :]
 
-                # Resize back to original size
                 image = torch.nn.functional.interpolate(
-                    image.permute(0, 3, 1, 2),  # [b, h, w, c] -> [b, c, h, w]
+                    image.permute(0, 3, 1, 2),
                     size=(height, width),
                     mode="bilinear",
                     align_corners=False,
-                ).permute(0, 2, 3, 1)  # [b, c, h, w] -> [b, h, w, c]
+                ).permute(0, 2, 3, 1)
 
-                # Random rotation (small angles)
-                # Use tensor operations instead of .item() for torch.compile compatibility
-                angle = torch.rand(1, device=image.device) * 10 - 5  # Random angle between -5 and 5 degrees
-                if torch.abs(angle) > 0.1:  # Only rotate if angle is significant
-                    # Convert to radians
+                angle = torch.rand(1, device=image.device) * (2 * rotation_deg) - rotation_deg
+                if torch.abs(angle) > 0.1:
                     angle_rad = angle * torch.pi / 180.0
-
-                    # Create rotation matrix
                     cos_a = torch.cos(angle_rad)
                     sin_a = torch.sin(angle_rad)
 
-                    # Apply rotation using grid_sample
-                    grid_x = torch.linspace(-1, 1, width, device=image.device)
+                    grid_x = torch.linspace(-1, 1, width,  device=image.device)
                     grid_y = torch.linspace(-1, 1, height, device=image.device)
-
-                    # Create meshgrid
                     grid_y, grid_x = torch.meshgrid(grid_y, grid_x, indexing="ij")
-
-                    # Expand to batch dimension
                     grid_x = grid_x.unsqueeze(0).expand(image.shape[0], -1, -1)
                     grid_y = grid_y.unsqueeze(0).expand(image.shape[0], -1, -1)
 
-                    # Apply rotation transformation
                     grid_x_rot = grid_x * cos_a - grid_y * sin_a
                     grid_y_rot = grid_x * sin_a + grid_y * cos_a
-
-                    # Stack and reshape for grid_sample
                     grid = torch.stack([grid_x_rot, grid_y_rot], dim=-1)
 
                     image = torch.nn.functional.grid_sample(
-                        image.permute(0, 3, 1, 2),  # [b, h, w, c] -> [b, c, h, w]
+                        image.permute(0, 3, 1, 2),
                         grid,
                         mode="bilinear",
                         padding_mode="zeros",
                         align_corners=False,
-                    ).permute(0, 2, 3, 1)  # [b, c, h, w] -> [b, h, w, c]
+                    ).permute(0, 2, 3, 1)
 
-            # Color augmentations for all cameras
-            # Random brightness
-            # Use tensor operations instead of .item() for torch.compile compatibility
-            brightness_factor = 0.7 + torch.rand(1, device=image.device) * 0.6  # Random factor between 0.7 and 1.3
+            brightness_factor = brightness_lo + torch.rand(1, device=image.device) * (brightness_hi - brightness_lo)
             image = image * brightness_factor
 
-            # Random contrast
-            # Use tensor operations instead of .item() for torch.compile compatibility
-            contrast_factor = 0.6 + torch.rand(1, device=image.device) * 0.8  # Random factor between 0.6 and 1.4
+            contrast_factor = contrast_lo + torch.rand(1, device=image.device) * (contrast_hi - contrast_lo)
             mean = image.mean(dim=[1, 2, 3], keepdim=True)
             image = (image - mean) * contrast_factor + mean
 
-            # Random saturation (convert to HSV, modify S, convert back)
-            # For simplicity, we'll just apply a random scaling to the color channels
-            # Use tensor operations instead of .item() for torch.compile compatibility
-            saturation_factor = 0.5 + torch.rand(1, device=image.device) * 1.0  # Random factor between 0.5 and 1.5
+            saturation_factor = saturation_lo + torch.rand(1, device=image.device) * (saturation_hi - saturation_lo)
             gray = image.mean(dim=-1, keepdim=True)
             image = gray + (image - gray) * saturation_factor
 
-            # Clamp values to [0, 1]
             image = torch.clamp(image, 0, 1)
-
-            # Back to [-1, 1]
             image = image * 2.0 - 1.0
 
         # Convert back to [B, C, H, W] format if it was originally channels-first
