@@ -302,8 +302,7 @@ def train_ae(cfg, device, use_ddp, is_main):
                 self.token_loss_mask = None
         obs = _Obs(batch)
 
-        raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        loss = raw_model(
+        loss = model(
             observation=obs,
             start_proprio=batch["start_proprio"],
             end_proprio=batch["end_proprio"],
@@ -507,8 +506,7 @@ def train_vlm(cfg, device, use_ddp, is_main):
         for pg in optimizer.param_groups:
             pg["lr"] = cosine_lr(global_step, warmup, peak_lr, decay_steps, end_lr)
 
-        raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        loss = raw_model(batch)
+        loss = model(batch)
 
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)

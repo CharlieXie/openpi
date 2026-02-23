@@ -62,7 +62,16 @@ class ProprioTokenizer:
 
     def decode(self, token_ids: np.ndarray) -> np.ndarray:
         """Decode token IDs back to continuous bin-center values."""
-        bin_indices = _PROPRIO_BASE - np.asarray(token_ids)
+        token_ids = np.asarray(token_ids)
+        bin_indices = _PROPRIO_BASE - token_ids
+        out_of_range = (bin_indices < 0) | (bin_indices >= self.n_bins)
+        if np.any(out_of_range):
+            bad_ids = token_ids[out_of_range].tolist()
+            logger.warning(
+                f"ProprioTokenizer.decode: {int(np.sum(out_of_range))}/{token_ids.size} "
+                f"token(s) outside proprio range [{_PROPRIO_BASE - self.n_bins + 1}, "
+                f"{_PROPRIO_BASE}]: {bad_ids[:5]}{'...' if len(bad_ids) > 5 else ''}"
+            )
         bin_indices = np.clip(bin_indices, 0, self.n_bins - 1)
         return self.bin_centers[bin_indices].astype(np.float32)
 
@@ -108,7 +117,14 @@ class WaypointTokenizer:
         return _DURATION_BASE - d
 
     def decode_duration(self, token_id: int) -> int:
-        return int(_DURATION_BASE - token_id)
+        dur = int(_DURATION_BASE - token_id)
+        if dur < 0 or dur > DURATION_MAX:
+            logger.warning(
+                f"decode_duration: token_id={token_id} decoded to duration={dur} "
+                f"(valid: 0-{DURATION_MAX}), token outside duration range "
+                f"[{_DURATION_BASE - DURATION_N_BINS + 1}, {_DURATION_BASE}]"
+            )
+        return dur
 
     def is_proprio_token(self, token_id: int) -> bool:
         return (_PROPRIO_BASE - PROPRIO_N_BINS + 1) <= token_id <= _PROPRIO_BASE

@@ -1,6 +1,6 @@
 # Waypoint VLA — openpi 实现设计文档
 
-> 最后更新: 2026-02-22 (rev 4 — LIBERO 评测管线完善)
+> 最后更新: 2026-02-23 (rev 5 — VLM 推理 logit masking 修复 + 训练 DDP 修复)
 > 基于 Pi0.5 (PyTorch) 在 openpi 项目中实现两段式 Waypoint VLA 系统
 
 ---
@@ -292,19 +292,26 @@ active_logits = lm_head(active_hidden.float()) # [N_valid, vocab_size]
 loss = F.cross_entropy(active_logits, active_targets)
 ```
 
-### 推理 (Constrained Decoding)
+### 推理 (Constrained Decoding + Logit Masking)
 
 ```python
 # 强制在正确位置注入 <wp>/<dur> delimiter
 # 模型只自由预测 proprio token 位置 (8 个 per WP) 和 duration token 位置 (1 个 per WP)
+#
+# **关键**: 自由预测位置必须做 logit masking，将 argmax 限制在合法 token 子集内
+# 否则 257K 词表中 pretrained 的语言 token 先验会压过 292 个 waypoint token
 for step in range(max_steps):
     pos_in_wp = (wp_token_count) % tokens_per_waypoint
     if pos_in_wp == 0:
         force_token = wp_token_id       # 强制 <wp>
     elif pos_in_wp == proprio_dim + 1:
         force_token = dur_token_id      # 强制 <dur>
-    else:
-        force_token = argmax(logits)    # 模型自由预测
+    elif 1 <= pos_in_wp <= proprio_dim:
+        logits[outside_proprio_range] = -inf  # 只允许 256 个 proprio bin token
+        force_token = argmax(logits)
+    elif pos_in_wp == proprio_dim + 2:
+        logits[outside_duration_range] = -inf # 只允许 34 个 duration token
+        force_token = argmax(logits)
 ```
 
 ---
@@ -531,6 +538,23 @@ Project: `waypoint_vla`
 ### 评测 — GPU 显存
 - VLM (float32) ~11.7 GB + AE (bfloat16) ~7.5 GB ≈ **19.2 GB**
 - 单张 RTX 4090 (24 GB) 可运行；两个模型同时在 GPU 上，无需 swap
+
+### 评测 — VLM Logit Masking (rev 5 修复)
+- **问题**: VLM 的 `generate_waypoints()` 在自由预测位置（proprio / duration）对 257,152 个全词表做 argmax，pretrained 语言 token 先验远高于 292 个专用 waypoint token，导致 argmax 始终落在普通词表 token 上
+- **表现**: 所有 proprio 解码为 0.9961（bin 255），duration 解码为 253416 等荒谬值
+- **根因**: `ProprioTokenizer.decode()` 的 `np.clip(bin_indices, 0, 255)` 将任何普通词表 token 静默映射到 bin 255；`decode_duration()` 无范围检查
+- **修复 (vlm_model.py)**: 在 `generate_waypoints()` 中，proprio 位置仅允许 token 256768–257023，duration 位置仅允许 token 256734–256767，其余设为 `-inf`
+- **修复 (tokenizer.py)**: `decode()` 和 `decode_duration()` 添加越界 warning，不再静默吞掉错误
+- **修复 (eval_libero.py)**: duration 超过 `horizon_steps` 时 clamp 并打 warning
+
+### 训练 — DDP Forward 调用 (rev 5 修复)
+- **问题**: `train_waypoint.py` 的 VLM/AE 训练循环使用 `raw_model(batch)`（绕过 DDP wrapper），可能导致 `find_unused_parameters=True` 时梯度同步异常
+- **修复**: 改为 `model(batch)` / `model(observation=..., ...)` 直接调用 DDP 包裹的模型
+
+### 评测 — 归一化统计量路径一致性
+- 训练和评测**必须**使用完全相同的 `dataset_statistics.json`
+- 不一致会导致 state prompt 离散化值有分布偏移，降低模型预测质量
+- 评测配置中的 `dataset_statistics_path` 应与训练配置中的路径指向同一份统计量文件
 
 ---
 

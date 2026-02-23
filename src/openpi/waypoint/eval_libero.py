@@ -391,6 +391,7 @@ def run_episode(
         start_wp = state_padded.copy()
         steps_this_cycle = 0
 
+        max_dur = cfg.get("horizon_steps", 32)
         for wp_idx, (proprio_values, duration) in enumerate(waypoints):
             if duration == 0:
                 break
@@ -399,6 +400,9 @@ def run_episode(
             if duration < 0:
                 logger.warning(f"    wp[{wp_idx}]: negative duration {duration}, skipping")
                 continue
+            if duration > max_dur:
+                logger.warning(f"    wp[{wp_idx}]: duration {duration} exceeds max {max_dur}, clamping")
+                duration = max_dur
 
             end_wp = pad_to_dim(proprio_values, model_proprio_dim)
 

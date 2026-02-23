@@ -5,11 +5,11 @@ robot_type: libero
 task_suite: libero_object
 
 # Model checkpoints (set these to your trained checkpoint directories)
-vlm_checkpoint: /workspace/models/vlm/12000
+vlm_checkpoint: /workspace/models/vlm/800
 ae_checkpoint: /workspace/models/ae/2400
 
 # Data / normalization
-dataset_statistics_path: /workspace/data/libero_object_no_noops/1.0.0
+dataset_statistics_path: /workspace/data/dataset_statistics.json
 
 # Model dimensions
 model_action_dim: 32

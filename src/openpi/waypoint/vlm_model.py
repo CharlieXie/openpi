@@ -17,7 +17,11 @@ from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
 from openpi.waypoint.tokenizer import (
     PALIGEMMA_VOCAB_SIZE,
     _DUR_TOKEN_ID,
+    _DURATION_BASE,
+    _PROPRIO_BASE,
     _WP_TOKEN_ID,
+    DURATION_N_BINS,
+    PROPRIO_N_BINS,
 )
 
 logger = logging.getLogger(__name__)
@@ -279,7 +283,28 @@ class PI0WaypointVLM(nn.Module):
 
         all_output_tokens = [[] for _ in range(B)]
 
+        vocab_size = last_logits.shape[-1]
+        proprio_lo = _PROPRIO_BASE - PROPRIO_N_BINS + 1  # 256768
+        proprio_hi = _PROPRIO_BASE                        # 257023
+        duration_lo = _DURATION_BASE - DURATION_N_BINS + 1  # 256734
+        duration_hi = _DURATION_BASE                        # 256767
+
         for step in range(max_new_tokens):
+            for b in range(B):
+                if header_injected[b]:
+                    wp_count = len(all_output_tokens[b])
+                    pos_in_wp = wp_count % tpw
+                    is_proprio_pos = 1 <= pos_in_wp <= wp_tokenizer.proprio_dim
+                    is_duration_pos = pos_in_wp == wp_tokenizer.proprio_dim + 2
+                    if is_proprio_pos:
+                        mask_val = torch.full((vocab_size,), float('-inf'), device=device)
+                        mask_val[proprio_lo : proprio_hi + 1] = 0.0
+                        last_logits[b, 0] += mask_val
+                    elif is_duration_pos:
+                        mask_val = torch.full((vocab_size,), float('-inf'), device=device)
+                        mask_val[duration_lo : duration_hi + 1] = 0.0
+                        last_logits[b, 0] += mask_val
+
             if temperature > 0:
                 probs = F.softmax(last_logits[:, 0] / temperature, dim=-1)
                 next_token = torch.multinomial(probs, 1)
@@ -330,7 +355,29 @@ class PI0WaypointVLM(nn.Module):
 
         results = []
         for b in range(B):
-            waypoints = wp_tokenizer.decode_waypoints(all_output_tokens[b])
+            tids = all_output_tokens[b]
+            n_proprio_ok = sum(
+                1 for i, t in enumerate(tids)
+                if (i % tpw) >= 1 and (i % tpw) <= wp_tokenizer.proprio_dim
+                and proprio_lo <= t <= proprio_hi
+            )
+            n_duration_ok = sum(
+                1 for i, t in enumerate(tids)
+                if (i % tpw) == wp_tokenizer.proprio_dim + 2
+                and duration_lo <= t <= duration_hi
+            )
+            n_proprio_total = sum(
+                1 for i in range(len(tids)) if (i % tpw) >= 1 and (i % tpw) <= wp_tokenizer.proprio_dim
+            )
+            n_duration_total = sum(
+                1 for i in range(len(tids)) if (i % tpw) == wp_tokenizer.proprio_dim + 2
+            )
+            if n_proprio_total > 0 or n_duration_total > 0:
+                logger.debug(
+                    f"VLM raw tokens: proprio_in_range={n_proprio_ok}/{n_proprio_total}, "
+                    f"duration_in_range={n_duration_ok}/{n_duration_total}"
+                )
+            waypoints = wp_tokenizer.decode_waypoints(tids)
             results.append(waypoints)
 
         return results
