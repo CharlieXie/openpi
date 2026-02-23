@@ -239,7 +239,6 @@ def predict_waypoints(vlm, images, instruction, wp_tokenizer, state_norm, device
     prompt_text = f"Task: {instruction.strip().replace('_', ' ').lower()}, State: "
     discretized = np.digitize(np.clip(state_norm, -1, 1), np.linspace(-1, 1, 257)[:-1]) - 1
     prompt_text += " ".join(map(str, discretized.astype(int))) + ";\n"
-    prompt_text += "Action: "
 
     prompt_tokens_list = wp_tokenizer._pg_tokenizer.encode(prompt_text, add_bos=True)
     prompt_tokens = torch.tensor([prompt_tokens_list], dtype=torch.long, device=device)

@@ -129,7 +129,7 @@ class WaypointVLMDataset(IterableDataset):
                         wp_pad_mask_proprio[j] = False
 
                         if j > 0:
-                            wp_durations[j - 1] = all_durations[wp_idx - 1 + start_idx] if (wp_idx - 1 + start_idx) < len(all_durations) else 0
+                            wp_durations[j - 1] = all_durations[wp_idx - 1] if (wp_idx - 1) < len(all_durations) else 0
                             wp_pad_mask_duration[j - 1] = False
 
                     if actual_wps >= 1:

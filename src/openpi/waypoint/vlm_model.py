@@ -289,7 +289,7 @@ class PI0WaypointVLM(nn.Module):
             if token_emb.dtype != self.paligemma.language_model.embed_tokens.weight.dtype:
                 token_emb = token_emb.to(self.paligemma.language_model.embed_tokens.weight.dtype)
 
-            positions = prefill_len[:, None] + step + 1
+            positions = prefill_len[:, None] + step
             attn_len = prefix_len + step + 1
             mask = torch.ones(B, 1, 1, attn_len, device=device) * 0.0
 
