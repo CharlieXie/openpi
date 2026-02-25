@@ -57,13 +57,25 @@ MAX_STEPS_MAP = {
 }
 
 
+# def quat2axisangle(quat):
+#     """Convert quaternion to axis-angle."""
+#     from transforms3d.quaternions import quat2axangle
+#     axis, angle = quat2axangle(quat)
+#     return (axis * angle).astype(np.float32)
+
 def quat2axisangle(quat):
-    """Convert quaternion to axis-angle."""
-    from transforms3d.quaternions import quat2axangle
-    axis, angle = quat2axangle(quat)
-    return (axis * angle).astype(np.float32)
-
-
+    """Convert quaternion (x,y,z,w) to axis-angle, matching robosuite convention."""
+    import math
+    q = quat.copy()
+    if q[3] > 1.0:
+        q[3] = 1.0
+    elif q[3] < -1.0:
+        q[3] = -1.0
+    den = np.sqrt(1.0 - q[3] * q[3])
+    if math.isclose(den, 0.0):
+        return np.zeros(3, dtype=np.float32)
+    return (q[:3] * 2.0 * math.acos(q[3]) / den).astype(np.float32)
+    
 def get_proprio_from_obs(obs):
     """Extract 8d LIBERO proprio: [EEF_pos(3), EEF_axisangle(3), gripper_qpos(2)]."""
     eef_pos = obs["robot0_eef_pos"]
