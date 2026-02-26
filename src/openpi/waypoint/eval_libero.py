@@ -149,6 +149,29 @@ def skip_init_weights():
             setattr(torch.nn.init, name, fn)
 
 
+def _apply_sdpa(gemma_model, label: str):
+    """Enable SDPA (Scaled Dot-Product Attention) on a GemmaModel.
+
+    Falls back to eager if SDPA is unavailable or fails.
+    """
+    try:
+        gemma_model.config._attn_implementation = "sdpa"
+        logger.info(f"{label}: enabled SDPA attention")
+    except Exception as e:
+        logger.warning(f"{label}: failed to enable SDPA: {e}")
+
+
+def _apply_compile(parent_module, attr_name: str, label: str):
+    """Apply torch.compile to a sub-module, replacing the attribute in-place."""
+    try:
+        original = getattr(parent_module, attr_name)
+        compiled = torch.compile(original)
+        setattr(parent_module, attr_name, compiled)
+        logger.info(f"{label}: enabled torch.compile")
+    except Exception as e:
+        logger.warning(f"{label}: torch.compile failed: {e}")
+
+
 def load_vlm(cfg, device):
     """Load VLM waypoint predictor from checkpoint.
 
@@ -159,12 +182,14 @@ def load_vlm(cfg, device):
     import openpi.models.pi0_config as pi0_config
 
     t0 = time.time()
+    vlm_precision = cfg.get("vlm_precision", "bfloat16")
     model_cfg = pi0_config.Pi0Config(
         pi05=False,
         max_token_len=cfg.get("max_token_len", 256),
         paligemma_variant=cfg.get("paligemma_variant", "gemma_2b"),
-        dtype="float32",
+        dtype=vlm_precision,
     )
+    logger.info(f"VLM precision: {vlm_precision}")
     with skip_init_weights():
         model = PI0WaypointVLM(model_cfg)
     logger.info(f"VLM model init: {time.time() - t0:.1f}s")
@@ -211,6 +236,12 @@ def load_vlm(cfg, device):
     t0 = time.time()
     model = model.to(device).eval()
     logger.info(f"VLM to {device}: {time.time() - t0:.1f}s")
+
+    _apply_sdpa(model.paligemma.model.language_model, "VLM language_model")
+
+    if cfg.get("torch_compile", False):
+        _apply_compile(model.paligemma.model, "language_model", "VLM language_model")
+
     return model
 
 
@@ -242,6 +273,15 @@ def load_ae(cfg, device):
     t0 = time.time()
     model = model.to(device).eval()
     logger.info(f"AE to {device}: {time.time() - t0:.1f}s")
+
+    _apply_sdpa(model.paligemma_with_expert.paligemma.model.language_model, "AE paligemma")
+    _apply_sdpa(model.paligemma_with_expert.gemma_expert.model, "AE gemma_expert")
+
+    if cfg.get("torch_compile", False):
+        _apply_compile(
+            model.paligemma_with_expert.gemma_expert, "model", "AE gemma_expert",
+        )
+
     return model
 
 
