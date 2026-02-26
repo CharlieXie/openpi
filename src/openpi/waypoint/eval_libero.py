@@ -14,7 +14,6 @@ import os
 os.environ["NUMBA_DISABLE_JIT"] = "1"
 
 import argparse
-import contextlib
 import json
 import logging
 import pathlib
@@ -84,20 +83,27 @@ def get_proprio_from_obs(obs):
     return np.concatenate([eef_pos, eef_rot, gripper]).astype(np.float32)
 
 
-def get_libero_images(env, obs, size=224):
+def get_libero_images(env, obs, size=224, save_dir=None, step=None):
     """Extract camera images from LIBERO observation."""
     from PIL import Image as PILImage
     images = {}
     agentview = obs.get("agentview_image", obs.get("agentview_rgb"))
     if agentview is not None:
-        img = PILImage.fromarray(agentview[::-1])
+        img = PILImage.fromarray(agentview[::-1, ::-1])
+        # img = PILImage.fromarray(agentview[::-1])
+
         if img.size != (size, size):
             img = img.resize((size, size), PILImage.BILINEAR)
+        if save_dir is not None:
+            os.makedirs(save_dir, exist_ok=True)
+            suffix = f"_{step:05d}" if step is not None else ""
+            img.save(os.path.join(save_dir, f"agentview{suffix}.png"))
         images["base_0_rgb"] = np.array(img, dtype=np.uint8)
 
     wrist = obs.get("robot0_eye_in_hand_image", obs.get("robot0_eye_in_hand_rgb"))
     if wrist is not None:
-        img = PILImage.fromarray(wrist[::-1])
+        # img = PILImage.fromarray(wrist[::-1])
+        img = PILImage.fromarray(wrist[::-1, ::-1])
         if img.size != (size, size):
             img = img.resize((size, size), PILImage.BILINEAR)
         images["left_wrist_0_rgb"] = np.array(img, dtype=np.uint8)
@@ -109,32 +115,66 @@ def get_libero_images(env, obs, size=224):
 # Model loading
 # ---------------------------------------------------------------------------
 
-@contextlib.contextmanager
-def skip_init_weights():
-    """Bypass random weight initialization when loading from checkpoint.
+def _fix_weight_tying(state_dict):
+    """Duplicate tied weights so both keys exist in the state dict.
 
-    Saves ~30-60s for large models (3B+ params) by replacing torch.nn.init
-    functions with no-ops. Safe when all weights are overwritten by a checkpoint.
+    HuggingFace PaliGemma ties embed_tokens and lm_head weights, so the
+    checkpoint may only store one copy. We need both for load_state_dict.
+    Works with arbitrary prefixes (e.g. paligemma_with_expert.paligemma.).
     """
-    saved = {}
-    _noop = lambda x, *a, **kw: x
-    for name in (
-        "kaiming_uniform_", "kaiming_normal_", "xavier_uniform_", "xavier_normal_",
-        "uniform_", "normal_", "zeros_", "ones_", "constant_", "orthogonal_",
-        "trunc_normal_",
-    ):
-        if hasattr(torch.nn.init, name):
-            saved[name] = getattr(torch.nn.init, name)
-            setattr(torch.nn.init, name, _noop)
-    try:
-        yield
-    finally:
-        for name, fn in saved.items():
-            setattr(torch.nn.init, name, fn)
+    for key in list(state_dict.keys()):
+        if key.endswith(".lm_head.weight"):
+            prefix = key[: -len("lm_head.weight")]
+            embed_key = prefix + "model.language_model.embed_tokens.weight"
+            if embed_key not in state_dict:
+                state_dict[embed_key] = state_dict[key]
+        elif key.endswith(".model.language_model.embed_tokens.weight"):
+            prefix = key[: -len("model.language_model.embed_tokens.weight")]
+            lm_head_key = prefix + "lm_head.weight"
+            if lm_head_key not in state_dict:
+                state_dict[lm_head_key] = state_dict[key]
+
+
+def _materialize_meta_tensors(module):
+    """Replace remaining meta tensors after load_state_dict(assign=True).
+
+    Handles two categories:
+    1. Parameters not in checkpoint (should not happen if _fix_weight_tying
+       was applied, but kept as safety net).
+    2. Non-persistent buffers (position_ids, inv_freq, etc.) that are computed
+       in __init__ but not saved to checkpoint — these need correct values,
+       not garbage.
+    """
+    for mod in module.modules():
+        for name, param in list(mod.named_parameters(recurse=False)):
+            if param.is_meta:
+                setattr(mod, name, torch.nn.Parameter(
+                    torch.zeros(param.shape, dtype=param.dtype),
+                    requires_grad=param.requires_grad,
+                ))
+        for name in list(mod._buffers.keys()):
+            buf = mod._buffers[name]
+            if buf is None or not buf.is_meta:
+                continue
+            if name == "position_ids":
+                mod._buffers[name] = torch.arange(buf.shape[-1]).expand(buf.shape)
+            elif name == "inv_freq":
+                dim = buf.shape[0] * 2
+                base = getattr(mod, "base", 10000.0)
+                if hasattr(mod, "config") and hasattr(mod.config, "rope_theta"):
+                    base = mod.config.rope_theta
+                inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+                mod._buffers[name] = inv_freq
+            else:
+                mod._buffers[name] = torch.zeros(buf.shape, dtype=buf.dtype)
 
 
 def load_vlm(cfg, device):
     """Load VLM waypoint predictor from checkpoint.
+
+    Uses torch.device('meta') to construct the model skeleton without allocating
+    real memory (~0.5s vs ~100s with CPU allocation), then loads weights directly
+    via load_state_dict(assign=True) which replaces meta tensors in-place.
 
     Handles checkpoints saved from PI0WaypointAE structure by remapping
     paligemma_with_expert.paligemma.* -> paligemma.* keys.
@@ -149,7 +189,7 @@ def load_vlm(cfg, device):
         paligemma_variant=cfg.get("paligemma_variant", "gemma_2b"),
         dtype="float32",
     )
-    with skip_init_weights():
+    with torch.device("meta"):
         model = PI0WaypointVLM(model_cfg)
     logger.info(f"VLM model init: {time.time() - t0:.1f}s")
 
@@ -157,8 +197,6 @@ def load_vlm(cfg, device):
     ckpt_file = os.path.join(ckpt_path, "model.safetensors")
     logger.info(f"Loading VLM from {ckpt_path}")
 
-    # Read only the safetensors header (~91KB) to detect key format,
-    # instead of loading the entire checkpoint (~11GB) just to inspect keys.
     with open(ckpt_file, "rb") as f:
         header_size = int.from_bytes(f.read(8), "little")
         header_keys = list(json.loads(f.read(header_size)).keys())
@@ -167,29 +205,24 @@ def load_vlm(cfg, device):
     has_pg_nested = any(k.startswith("paligemma_with_expert.paligemma.") for k in header_keys)
 
     t0 = time.time()
+    state_dict = safetensors.torch.load_file(ckpt_file, device="cpu")
     if has_pg_direct:
-        safetensors.torch.load_model(model, ckpt_file)
+        _fix_weight_tying(state_dict)
+        model.load_state_dict(state_dict, assign=True, strict=False)
     elif has_pg_nested:
         PREFIX = "paligemma_with_expert.paligemma."
-        state_dict = safetensors.torch.load_file(ckpt_file, device="cpu")
-        remapped = {}
-        for k, v in state_dict.items():
-            if k.startswith(PREFIX):
-                new_key = "paligemma." + k[len(PREFIX):]
-                remapped[new_key] = v
-        own_state = model.state_dict()
-        loaded, skipped = 0, 0
-        for k, v in remapped.items():
-            if k in own_state and own_state[k].shape == v.shape:
-                own_state[k].copy_(v)
-                loaded += 1
-            else:
-                skipped += 1
-        model.load_state_dict(own_state, strict=False)
-        del state_dict
-        logger.info(f"VLM: loaded {loaded} params, skipped {skipped} (remapped from AE checkpoint)")
+        remapped = {
+            "paligemma." + k[len(PREFIX):]: v
+            for k, v in state_dict.items()
+            if k.startswith(PREFIX)
+        }
+        _fix_weight_tying(remapped)
+        model.load_state_dict(remapped, assign=True, strict=False)
+        logger.info(f"VLM: loaded {len(remapped)} params (remapped from AE checkpoint)")
     else:
         raise ValueError(f"Cannot find PaliGemma weights in checkpoint: {ckpt_file}")
+    del state_dict
+    _materialize_meta_tensors(model)
     logger.info(f"VLM weight load: {time.time() - t0:.1f}s")
 
     t0 = time.time()
@@ -199,7 +232,11 @@ def load_vlm(cfg, device):
 
 
 def load_ae(cfg, device):
-    """Load Action Expert from checkpoint."""
+    """Load Action Expert from checkpoint.
+
+    Uses torch.device('meta') for fast skeleton construction, then loads
+    weights via load_state_dict(assign=True).
+    """
     from openpi.waypoint.ae_model import PI0WaypointAE
     import openpi.models.pi0_config as pi0_config
 
@@ -213,14 +250,20 @@ def load_ae(cfg, device):
         action_expert_variant=cfg.get("action_expert_variant", "gemma_300m"),
         dtype=cfg.get("precision", "bfloat16"),
     )
-    with skip_init_weights():
+    with torch.device("meta"):
         model = PI0WaypointAE(model_cfg)
     logger.info(f"AE model init: {time.time() - t0:.1f}s")
 
     ckpt_path = cfg["ae_checkpoint"]
     logger.info(f"Loading Action Expert from {ckpt_path}")
     t0 = time.time()
-    safetensors.torch.load_model(model, os.path.join(ckpt_path, "model.safetensors"))
+    state_dict = safetensors.torch.load_file(
+        os.path.join(ckpt_path, "model.safetensors"), device="cpu"
+    )
+    _fix_weight_tying(state_dict)
+    model.load_state_dict(state_dict, assign=True, strict=False)
+    del state_dict
+    _materialize_meta_tensors(model)
     logger.info(f"AE weight load: {time.time() - t0:.1f}s")
 
     t0 = time.time()
@@ -377,7 +420,7 @@ def run_episode(
         if agentview is not None:
             replay_images.append(np.ascontiguousarray(agentview[::-1, ::-1]))
 
-        images = get_libero_images(env, obs)
+        images = get_libero_images(env, obs, save_dir="/workspace/openpi/data/libero/images", step=t)
         proprio_raw = get_proprio_from_obs(obs)
         proprio_norm = norm_helper.normalize_proprio(proprio_raw)
         state_padded = pad_to_dim(proprio_norm, model_proprio_dim)
@@ -418,7 +461,7 @@ def run_episode(
 
             end_wp = pad_to_dim(proprio_values, model_proprio_dim)
 
-            fresh_images = get_libero_images(env, obs)
+            fresh_images = get_libero_images(env, obs, save_dir="/workspace/openpi/data/libero/images", step=t)
             t_ae = time.time()
             actions_norm = predict_actions(
                 ae_model, fresh_images, task_desc, start_wp, end_wp, duration, device, pg_tok,
