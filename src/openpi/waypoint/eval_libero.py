@@ -48,6 +48,9 @@ from openpi.waypoint.tokenizer import WaypointTokenizer
 
 logger = logging.getLogger(__name__)
 
+_image_save_dir = None
+_image_frame_idx = 0
+
 MAX_STEPS_MAP = {
     "libero_spatial": 220,
     "libero_object": 280,
@@ -86,21 +89,34 @@ def get_proprio_from_obs(obs):
 
 def get_libero_images(env, obs, size=224):
     """Extract camera images from LIBERO observation."""
+    global _image_frame_idx
     from PIL import Image as PILImage
     images = {}
     agentview = obs.get("agentview_image", obs.get("agentview_rgb"))
     if agentview is not None:
-        img = PILImage.fromarray(agentview[::-1])
+        img = PILImage.fromarray(agentview[::-1, ::-1])
         if img.size != (size, size):
             img = img.resize((size, size), PILImage.BILINEAR)
         images["base_0_rgb"] = np.array(img, dtype=np.uint8)
 
     wrist = obs.get("robot0_eye_in_hand_image", obs.get("robot0_eye_in_hand_rgb"))
     if wrist is not None:
-        img = PILImage.fromarray(wrist[::-1])
+        img = PILImage.fromarray(wrist[::-1, ::-1])
         if img.size != (size, size):
             img = img.resize((size, size), PILImage.BILINEAR)
         images["left_wrist_0_rgb"] = np.array(img, dtype=np.uint8)
+
+    if _image_save_dir is not None and images:
+        frames = []
+        if "base_0_rgb" in images:
+            frames.append(images["base_0_rgb"])
+        if "left_wrist_0_rgb" in images:
+            frames.append(images["left_wrist_0_rgb"])
+        if frames:
+            combined = np.concatenate(frames, axis=1)
+            save_path = pathlib.Path(_image_save_dir) / f"frame_{_image_frame_idx:06d}.png"
+            PILImage.fromarray(combined).save(str(save_path))
+            _image_frame_idx += 1
 
     return images
 
@@ -243,7 +259,7 @@ def predict_waypoints(vlm, images, instruction, wp_tokenizer, state_norm, device
         img_tensors[key] = t.unsqueeze(0).to(device)
         img_masks[key] = torch.ones(1, dtype=torch.bool, device=device)
 
-    for model_key in ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"]:
+    for model_key in ["base_0_rgb", "left_wrist_0_rgb"]:
         if model_key not in img_tensors:
             img_tensors[model_key] = torch.zeros(1, 224, 224, 3, device=device)
             img_masks[model_key] = torch.zeros(1, dtype=torch.bool, device=device)
@@ -375,7 +391,20 @@ def run_episode(
     while t < max_steps + num_steps_wait and not done:
         agentview = obs.get("agentview_image", obs.get("agentview_rgb"))
         if agentview is not None:
-            replay_images.append(np.ascontiguousarray(agentview[::-1, ::-1]))
+            head_frame = np.ascontiguousarray(agentview[::-1, ::-1])
+            wrist_raw = obs.get("robot0_eye_in_hand_image", obs.get("robot0_eye_in_hand_rgb"))
+            if wrist_raw is not None:
+                wrist_frame = np.ascontiguousarray(wrist_raw[::-1, ::-1])
+                if wrist_frame.shape[0] != head_frame.shape[0]:
+                    from PIL import Image as PILImage
+                    wrist_frame = np.array(
+                        PILImage.fromarray(wrist_frame).resize(
+                            (wrist_frame.shape[1], head_frame.shape[0]), PILImage.BILINEAR
+                        )
+                    )
+                replay_images.append(np.concatenate([head_frame, wrist_frame], axis=1))
+            else:
+                replay_images.append(head_frame)
 
         images = get_libero_images(env, obs)
         proprio_raw = get_proprio_from_obs(obs)
@@ -446,7 +475,20 @@ def run_episode(
 
                 agentview = obs.get("agentview_image", obs.get("agentview_rgb"))
                 if agentview is not None:
-                    replay_images.append(np.ascontiguousarray(agentview[::-1, ::-1]))
+                    head_frame = np.ascontiguousarray(agentview[::-1, ::-1])
+                    wrist_raw = obs.get("robot0_eye_in_hand_image", obs.get("robot0_eye_in_hand_rgb"))
+                    if wrist_raw is not None:
+                        wrist_frame = np.ascontiguousarray(wrist_raw[::-1, ::-1])
+                        if wrist_frame.shape[0] != head_frame.shape[0]:
+                            from PIL import Image as PILImage
+                            wrist_frame = np.array(
+                                PILImage.fromarray(wrist_frame).resize(
+                                    (wrist_frame.shape[1], head_frame.shape[0]), PILImage.BILINEAR
+                                )
+                            )
+                        replay_images.append(np.concatenate([head_frame, wrist_frame], axis=1))
+                    else:
+                        replay_images.append(head_frame)
 
                 if done:
                     break
@@ -493,6 +535,12 @@ def evaluate(cfg):
 
     video_out_path = pathlib.Path(cfg.get("video_out_path", "data/libero/videos"))
     video_out_path.mkdir(parents=True, exist_ok=True)
+
+    global _image_save_dir, _image_frame_idx
+    _image_save_dir = pathlib.Path("image")
+    _image_save_dir.mkdir(parents=True, exist_ok=True)
+    _image_frame_idx = 0
+    logger.info(f"Inference images will be saved to: {_image_save_dir.resolve()}")
 
     from libero.libero import benchmark
 
@@ -549,6 +597,14 @@ def evaluate(cfg):
                 logger.info(f"  -> {suffix.upper()} ({ep_secs:.1f}s, video: {video_file})")
             else:
                 logger.info(f"  -> {suffix.upper()} ({ep_secs:.1f}s)")
+
+            trials_done = trial + 1
+            task_sr = successes / trials_done
+            overall_sr = total_success / max(total_episodes, 1)
+            logger.info(
+                f"  [成功率] 当前任务: {successes}/{trials_done} = {task_sr:.2%} | "
+                f"整体: {total_success}/{total_episodes} = {overall_sr:.2%}"
+            )
 
         results[task_name] = {
             "success_rate": successes / min(num_trials, len(initial_states)),

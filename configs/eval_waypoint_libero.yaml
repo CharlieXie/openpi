@@ -27,7 +27,7 @@ precision: bfloat16
 norm_type: q99
 
 # Evaluation
-num_trials_per_task: 3
+num_trials_per_task: 10
 num_steps_wait: 10
 
 # Video output
