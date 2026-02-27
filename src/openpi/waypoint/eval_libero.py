@@ -708,7 +708,7 @@ def evaluate(cfg):
         }
         t0 = time.time()
         env = OffScreenRenderEnv(**env_args)
-        env.seed(0)
+        env.seed(7)
         logger.info(f"Env init for task {task_idx}: {time.time() - t0:.1f}s")
         slot = _Slot(
             task_idx=info["task_idx"],
