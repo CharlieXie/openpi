@@ -3,23 +3,47 @@
 ## 运行方式
 
 ```bash
-# 基本运行（num_parallel 默认等于 num_tasks，全任务并行）
-cd /workspace/exp/openpi
-python -m openpi.waypoint.eval_libero --config configs/eval_waypoint_libero.yaml
+cd /workspace/openpi
 
-# 控制并发 env 数量（显式指定，适合内存受限场景）
-python -m openpi.waypoint.eval_libero --config configs/eval_waypoint_libero.yaml
-# 在 YAML 中设置: num_parallel: 4
+MUJOCO_GL=osmesa \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+PYTHONPATH=$PWD/third_party/libero:$PYTHONPATH \
+PYTHONFAULTHANDLER=1 \
+.venv/bin/python -u -m openpi.waypoint.eval_libero \
+  --config configs/eval_waypoint_libero.yaml \
+  2>&1 | tee logs/eval_libero.log
 ```
 
-YAML 所有可配项：
+| 环境变量 | 说明 |
+|----------|------|
+| `MUJOCO_GL=osmesa` | 无显示器的离屏渲染（headless server） |
+| `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | 减少显存碎片，适合多 env 并行时的动态 batch |
+| `PYTHONPATH=$PWD/third_party/libero:$PYTHONPATH` | 使用项目自带的 libero 而非系统安装版 |
+| `PYTHONFAULTHANDLER=1` | segment fault 时打印 Python 调用栈 |
+
+---
+
+## `num_parallel` 配置
+
+在 `configs/eval_waypoint_libero.yaml` 中设置：
 
 ```yaml
 # Evaluation
 num_trials_per_task: 50    # 每个 task 跑多少 trial
 num_steps_wait: 10         # 每个 trial 开头的 warm-up dummy action 步数
-num_parallel: 10           # 同时运行的 task 环境数（默认 = num_tasks）
+num_parallel: 4            # 同时运行的 task 环境数（默认 = num_tasks，即全部并行）
 ```
+
+| `num_parallel` 取值 | 行为 |
+|---------------------|------|
+| `1` | 等价于原始串行版，可用于对照验证结果 |
+| `4`～`8` | 推荐值，AE batch size 在 4–8 之间，GPU 利用率显著提升 |
+| `num_tasks`（默认）| 所有任务同时跑，AE batch size 最大，但需确保 CPU 内存足够开这么多 env |
+
+**何时降低 `num_parallel`**：
+- 出现 CPU 内存（RAM）不足时（每个 env 约占 2–4 GB）
+- 需要减少日志交错、方便调试时设为 `1`
+- GPU 显存不足时（大 batch 的 prefix KV cache 会占更多显存）
 
 ---
 
