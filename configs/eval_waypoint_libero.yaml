@@ -5,8 +5,8 @@ robot_type: libero
 task_suite: libero_object
 
 # Model checkpoints (set these to your trained checkpoint directories)
-vlm_checkpoint: /workspace/models/vlm/800
-ae_checkpoint: /workspace/models/ae/2400
+vlm_checkpoint: /workspace/models/vlm
+ae_checkpoint: /workspace/models/ae
 
 # Data / normalization
 dataset_statistics_path: /workspace/data/dataset_statistics.json
@@ -26,9 +26,14 @@ precision: bfloat16
 # Normalization
 norm_type: q99
 
+# Inference optimization
+vlm_precision: bfloat16
+torch_compile: true
+
 # Evaluation
-num_trials_per_task: 3
+num_trials_per_task: 50
 num_steps_wait: 10
+# num_parallel: 10  # concurrent task envs (default: num_tasks)
 
 # Video output
-video_out_path: data/libero/videos_wp
+video_out_path: data/libero/videos_wp_spatial
