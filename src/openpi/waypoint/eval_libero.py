@@ -106,17 +106,17 @@ def get_libero_images(env, obs, size=224):
             img = img.resize((size, size), PILImage.BILINEAR)
         images["left_wrist_0_rgb"] = np.array(img, dtype=np.uint8)
 
-    if _image_save_dir is not None and images:
-        frames = []
-        if "base_0_rgb" in images:
-            frames.append(images["base_0_rgb"])
-        if "left_wrist_0_rgb" in images:
-            frames.append(images["left_wrist_0_rgb"])
-        if frames:
-            combined = np.concatenate(frames, axis=1)
-            save_path = pathlib.Path(_image_save_dir) / f"frame_{_image_frame_idx:06d}.png"
-            PILImage.fromarray(combined).save(str(save_path))
-            _image_frame_idx += 1
+    # if _image_save_dir is not None and images:
+    #     frames = []
+    #     if "base_0_rgb" in images:
+    #         frames.append(images["base_0_rgb"])
+    #     if "left_wrist_0_rgb" in images:
+    #         frames.append(images["left_wrist_0_rgb"])
+    #     if frames:
+    #         combined = np.concatenate(frames, axis=1)
+    #         save_path = pathlib.Path(_image_save_dir) / f"frame_{_image_frame_idx:06d}.png"
+    #         PILImage.fromarray(combined).save(str(save_path))
+    #         _image_frame_idx += 1
 
     return images
 
@@ -667,10 +667,27 @@ def main():
     logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--vlm-checkpoint", type=str, default=None,
+                        help="Override vlm_checkpoint in config")
+    parser.add_argument("--ae-checkpoint", type=str, default=None,
+                        help="Override ae_checkpoint in config")
+    parser.add_argument("--num-trials", type=int, default=None,
+                        help="Override num_trials_per_task in config")
+    parser.add_argument("--video-out-path", type=str, default=None,
+                        help="Override video_out_path in config")
     args = parser.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+
+    if args.vlm_checkpoint:
+        cfg["vlm_checkpoint"] = args.vlm_checkpoint
+    if args.ae_checkpoint:
+        cfg["ae_checkpoint"] = args.ae_checkpoint
+    if args.num_trials is not None:
+        cfg["num_trials_per_task"] = args.num_trials
+    if args.video_out_path:
+        cfg["video_out_path"] = args.video_out_path
 
     evaluate(cfg)
 
