@@ -1,6 +1,6 @@
 # Waypoint VLA — openpi 实现设计文档
 
-> 最后更新: 2026-02-23 (rev 5 — VLM 推理 logit masking 修复 + 训练 DDP 修复)
+> 最后更新: 2026-03-18 (rev 6 — Joint VLM+AE 联合训练)
 > 基于 Pi0.5 (PyTorch) 在 openpi 项目中实现两段式 Waypoint VLA 系统
 
 ---
@@ -40,14 +40,18 @@ openpi/
 │   ├── ae_model.py       # PI0WaypointAE (flow matching + duration AdaRMSNorm)
 │   ├── vlm_dataset.py    # WaypointVLMDataset (RLDS → VLM token sequences)
 │   ├── vlm_model.py      # PI0WaypointVLM (PaliGemma AR + CE loss)
-│   └── eval_libero.py    # 两段式 LIBERO 评测管线
+│   ├── joint_model.py    # PI0WaypointJoint (共享 backbone 联合 VLM+AE)  ← NEW
+│   └── eval_libero.py    # 两段式 LIBERO 评测管线 (支持独立/联合两种模式)
 ├── scripts/
-│   └── train_waypoint.py # 统一训练入口 (--mode ae|vlm)
+│   ├── train_waypoint.py       # 独立训练入口 (--mode ae|vlm)
+│   └── train_waypoint_joint.py # 联合训练入口                         ← NEW
 └── configs/
-    ├── waypoint_ae_libero.yaml    # LIBERO AE 训练配置
-    ├── waypoint_vlm_libero.yaml   # LIBERO VLM 训练配置
-    ├── waypoint_ae_r1lite.yaml    # R1 Lite AE 训练配置
-    └── eval_waypoint_libero.yaml  # LIBERO 评测配置
+    ├── waypoint_ae_libero.yaml         # LIBERO AE 训练配置
+    ├── waypoint_vlm_libero.yaml        # LIBERO VLM 训练配置
+    ├── waypoint_ae_r1lite.yaml         # R1 Lite AE 训练配置
+    ├── waypoint_joint_libero.yaml      # LIBERO 联合训练配置           ← NEW
+    ├── eval_waypoint_libero.yaml       # LIBERO 评测配置 (独立 VLM+AE)
+    └── eval_waypoint_joint_libero.yaml # LIBERO 评测配置 (联合模型)    ← NEW
 ```
 
 ---
@@ -588,3 +592,254 @@ VLM 全量 finetune PaliGemma 2B。v2 优化后内存占用大幅降低。
 | 12 | ~91-93 GB | 24 | v1 DDP 极限 (float32 + 全序列 logits) |
 | 14 | ~93 GB | 28 | v1 DDP 极限 |
 | 32+ | 待测 | 64+ | **v2 优化后预期可行** — 需重新 profiling |
+
+---
+
+## 十四、Joint VLM + AE 联合训练 (rev 6)
+
+### 动机
+
+原始设计中 VLM 和 AE 是两个独立模型，各自含有一份 PaliGemma backbone (Gemma 2B + SigLIP)：
+- 训练时：参数不共享，各自占用 ~11 GB × 2 = 22 GB backbone 权重
+- 推理时：需分别加载两个 checkpoint，占用双倍显存
+- 学习信号：VLM 的语言/视觉理解能力无法受益于 AE 的动作监督信号，反之亦然
+
+联合模型将 VLM 和 AE 的 PaliGemma backbone 合并为单一实例，通过梯度策略控制两种 loss 的交互。
+
+### 架构设计
+
+```
+PI0WaypointJoint (nn.Module)
+├── paligemma_with_expert (PaliGemmaWithExpertModel)  ← 单一实例，共享权重
+│   ├── paligemma (PaliGemmaForConditionalGeneration)
+│   │   ├── vision_tower (SigLIP)           ← VLM + AE 共享
+│   │   └── language_model (Gemma 2B)       ← VLM + AE 共享
+│   └── gemma_expert (GemmaForCausalLM 300M) ← 仅 AE 使用
+├── action_in_proj   (Linear 32→1024)       ← AE 专用
+├── action_out_proj  (Linear 1024→32)       ← AE 专用
+├── proprio_encoder  (Linear 32→1024)       ← AE 专用
+├── time_mlp_in      (Linear 2048→1024)     ← AE 专用 (新尺寸)
+└── time_mlp_out     (Linear 1024→1024)     ← AE 专用
+```
+
+关键区别于独立模型：
+1. VLM 路径通过 `paligemma_with_expert.paligemma` 做 CE loss（与 `PI0WaypointVLM` 相同逻辑）
+2. AE 路径通过完整 `paligemma_with_expert`（backbone + expert）做 MSE loss（与 `PI0WaypointAE` 相同逻辑）
+3. backbone 参数只存一份，VLM CE loss 和 AE MSE loss 的梯度可同时流入 backbone
+
+### 方法清单
+
+| 方法 | 用途 | 来源 |
+|------|------|------|
+| `forward(mode, **kwargs)` | DDP 兼容的分发入口，`mode="vlm"` 或 `"ae"` | 新增 |
+| `vlm_forward(batch)` | CE loss on waypoint tokens | 移植自 `vlm_model.py:106-201` |
+| `ae_forward(obs, start_proprio, end_proprio, actions, duration, ...)` | MSE flow-matching loss，含 stop_gradient 支持 | 移植自 `ae_model.py:166-242` |
+| `embed_prefix(images, img_masks, lang_tokens, lang_masks)` | 编码视觉+语言前缀 | 移植自 `ae_model.py:89-111` |
+| `embed_suffix(start_proprio, end_proprio, noisy_actions, timestep, duration)` | 编码 AE 后缀（proprio + actions + time/dur） | 移植自 `ae_model.py:113-164` |
+| `generate_waypoints(images, image_masks, prompt_tokens, prompt_mask, wp_tokenizer, ...)` | VLM constrained AR 推理 | 移植自 `vlm_model.py:203-383` |
+| `sample_actions(observation, start_proprio, end_proprio, duration, ...)` | AE 迭代去噪推理 | 移植自 `ae_model.py:244-331` |
+| `gradient_checkpointing_enable/disable()` | 同时控制 backbone + expert 的 checkpointing | 移植自 `ae_model.py:70-80` |
+| `load_pretrained_weights(model, weight_path, device)` | 静态方法，shape 不匹配容错加载 | 移植自 `train_waypoint.py:198-211` |
+
+### 梯度策略
+
+通过构造函数参数 `gradient_strategy` 控制，支持三种模式：
+
+#### `"none"` — 无隔离
+
+```
+VLM CE loss ──backprop──► backbone ◄──backprop── AE MSE loss
+```
+
+两种 loss 梯度自由流入 backbone 所有参数。最简单，但可能导致梯度冲突——CE 和 MSE 优化目标不同，可能让 backbone 在两个方向间震荡。
+
+#### `"stop_gradient"` — Detach AE prefix
+
+```
+VLM CE loss ──backprop──► backbone ──forward──► prefix_embs.detach() ──► AE
+                                                     ↑
+                                                  梯度阻断
+```
+
+在 `ae_forward()` 中，`embed_prefix()` 返回后执行 `prefix_embs = prefix_embs.detach()`。
+
+**原理**：AE 的 attention mask 设计决定了 prefix tokens (`ar_mask=0`) 不 attend to suffix tokens。因此 detach `prefix_embs` 完全阻断 MSE 梯度流向 backbone，而 AE expert、proprio_encoder、time_mlp 等 AE 专用层仍正常更新。
+
+**效果**：backbone 只接收 VLM CE 梯度，AE 只更新 expert + projection 层。
+
+#### `"freeze_backbone"` — 冻结 backbone
+
+```python
+# 构造函数中
+for param in self.paligemma_with_expert.paligemma.parameters():
+    param.requires_grad = False
+```
+
+backbone 完全冻结。VLM 和 AE 均无法更新 backbone。VLM CE loss 仍计算但不产生 backbone 梯度，AE 仅更新 expert + projection 层。
+
+适合 backbone 已经在大规模预训练中收敛、只需微调 AE 组件的场景。
+
+### 训练循环设计
+
+```python
+for global_step in range(num_steps):
+    # 1. 更新 LR (cosine decay with warmup)
+    lr = cosine_lr(global_step, warmup, peak_lr, decay_steps, end_lr)
+
+    # 2. VLM forward + backward（不同步 DDP 梯度）
+    with model.no_sync():              # DDP: 暂缓 allreduce
+        vlm_loss = model(mode="vlm", batch=vlm_batch)
+        vlm_loss.backward()            # 梯度累积到 .grad
+
+    # 3. AE forward + backward（触发 DDP 梯度同步）
+    ae_loss = model(mode="ae", observation=ae_obs, ...)
+    (ae_loss_weight * ae_loss).backward()  # 触发 allreduce
+
+    # 4. 优化器更新
+    grad_norm = clip_grad_norm_(model.parameters(), max_norm=1.0)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+```
+
+**关键设计决策：**
+
+1. **`model.no_sync()` + DDP**：VLM backward 不触发 allreduce，AE backward 触发 allreduce，同步 VLM+AE 两次 backward 累积的梯度。省去一次 allreduce 通信开销。
+
+2. **`forward(mode, **kwargs)`** 分发器：DDP 要求所有 forward 调用经过 `nn.Module.__call__`（即 DDP wrapper），才能正确追踪参数使用和触发 gradient sync hooks。直接调用 `model.module.vlm_forward()` 会绕过 DDP 导致梯度不同步。
+
+3. **两个独立 DataLoader**：VLM 和 AE 使用不同的数据集（`WaypointVLMDataset` vs `WaypointAEDataset`），各自有独立的 batch_size、shuffle_buffer 和 image augmentation 配置。
+
+4. **显存峰值 ≈ max(VLM_peak, AE_peak)**：每次 backward 释放计算图后再做下一次 forward，不同时持有两个计算图的激活。
+
+5. **`ae_loss_weight`**：AE loss 乘以权重系数后再 backward，控制 AE 梯度相对 VLM 梯度的比例。
+
+### 配置文件 (`waypoint_joint_libero.yaml`)
+
+```yaml
+# --- 联合训练专用字段 ---
+gradient_strategy: none    # "none" | "stop_gradient" | "freeze_backbone"
+ae_loss_weight: 1.0        # AE MSE loss 乘以此系数
+
+# 两套独立 batch size (per GPU)
+vlm_batch_size: 64
+ae_batch_size: 64
+
+# 两套数据路径
+# AE:
+original_rlds_dir: /workspace/data/libero/libero_object_no_noops/...
+wp_indices_path: /workspace/data/libero/libero_object_wp_001/waypoint_indices.json
+# VLM:
+wp_rlds_dir: /workspace/data/libero/libero_object_wp_001/waypoint_filtered_rlds__libero/1.0.0
+
+# 两套 token len
+ae_max_token_len: 64       # AE 语言 prompt 长度
+vlm_max_token_len: 256     # VLM waypoint 序列总长度
+
+# 两套 image augmentation
+image_aug_cfg: { ... }     # VLM augmentation (HF-style)
+ae_image_aug_cfg: { ... }  # AE augmentation (crop/rotation/color)
+
+# 两套 shuffle buffer
+vlm_shuffle_buffer_size: 5000
+ae_shuffle_buffer_size: 1000
+```
+
+### 训练命令
+
+```bash
+cd /workspace/openpi
+
+# 单卡
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+.venv/bin/python scripts/train_waypoint_joint.py \
+    --config configs/waypoint_joint_libero.yaml
+
+# 双卡 DDP
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+.venv/bin/torchrun --standalone --nnodes=1 --nproc_per_node=2 \
+    scripts/train_waypoint_joint.py \
+    --config configs/waypoint_joint_libero.yaml
+```
+
+### 权重加载
+
+联合模型使用与 AE 相同的权重加载策略：
+- 从 Pi0.5 base checkpoint (`model.safetensors`) 逐 key 加载
+- `time_mlp_in` shape 不匹配 (`[1024,1024]` → `[2048,1024]`) 自动跳过
+- 缺失的 key (如 `proprio_encoder`) 保持随机初始化
+
+```python
+PI0WaypointJoint.load_pretrained_weights(model, weight_path, device)
+```
+
+### Wandb 日志
+
+联合训练额外记录：
+
+| Metric | 含义 |
+|--------|------|
+| `train/vlm_loss` | VLM CE loss |
+| `train/ae_loss` | AE MSE loss |
+| `train/total_loss` | `vlm_loss + ae_loss_weight * ae_loss` |
+| `train/lr` | 当前 learning rate |
+| `train/grad_norm` | 梯度 L2 范数 (VLM+AE 梯度合计) |
+
+Summary 额外字段：
+- `gradient_strategy`: 使用的梯度策略
+- `ae_loss_weight`: AE loss 权重系数
+
+### 评测 — 联合模型
+
+`eval_libero.py` 支持两种加载模式，通过配置文件自动检测：
+
+**独立模式**（现有行为）：
+```yaml
+vlm_checkpoint: /path/to/vlm/checkpoint
+ae_checkpoint: /path/to/ae/checkpoint
+```
+
+**联合模式**（新增）：
+```yaml
+joint_checkpoint: /path/to/joint/checkpoint
+```
+
+当配置中存在 `joint_checkpoint` 时，`evaluate()` 自动切换到联合模式：
+```python
+if "joint_checkpoint" in cfg:
+    joint_model = load_joint(cfg, device)
+    vlm = joint_model      # generate_waypoints() 在 joint model 上
+    ae_model = joint_model  # sample_actions() 在 joint model 上
+```
+
+**接口兼容性**：`PI0WaypointJoint` 同时实现了 `generate_waypoints()` 和 `sample_actions()`，签名与独立模型完全相同，因此 `predict_waypoints()` 和 `predict_actions()` 无需修改。
+
+**显存优势**：联合模型只加载一份 backbone，推理时节省 ~5 GB 显存（约 ~14 GB vs ~19 GB）。
+
+### 验证清单
+
+1. **冒烟测试**: 单 GPU 运行 1 步确认无报错
+   ```bash
+   python scripts/train_waypoint_joint.py --config configs/waypoint_joint_libero.yaml
+   ```
+
+2. **梯度策略验证**: 分别测试三种策略，检查 backbone 参数梯度
+   - `none`: backbone 有来自 VLM CE + AE MSE 两个 loss 的梯度
+   - `stop_gradient`: backbone 只有 VLM CE 梯度（AE MSE 梯度被 detach 阻断）
+   - `freeze_backbone`: backbone 无梯度（`requires_grad=False`）
+
+3. **Wandb 日志**: 确认 `vlm_loss` 和 `ae_loss` 分别可见且数值合理
+
+4. **评测联合 checkpoint**: 使用 `eval_waypoint_joint_libero.yaml` 验证联合 checkpoint 可正常推理
+
+### 未修改的文件
+
+联合训练不修改以下现有文件，保持独立训练路径完整可用：
+
+| 文件 | 原因 |
+|------|------|
+| `ae_model.py` | 独立 AE 模型保持不变 |
+| `vlm_model.py` | 独立 VLM 模型保持不变 |
+| `ae_dataset.py` | 数据集不变，联合训练使用两个独立 DataLoader |
+| `vlm_dataset.py` | 同上 |
+| `train_waypoint.py` | 不修改，联合训练脚本从中 import 工具函数 |
+| `gemma_pytorch.py` | 不修改 attention 实现，梯度隔离在模型层面用 detach 实现 |

@@ -285,6 +285,55 @@ def load_ae(cfg, device):
     return model
 
 
+def load_joint(cfg, device):
+    """Load joint VLM+AE model from a single checkpoint.
+
+    The joint model shares a single PaliGemma backbone between VLM and AE,
+    saving ~50% VRAM compared to loading two separate models.
+    """
+    from openpi.waypoint.joint_model import PI0WaypointJoint
+    import openpi.models.pi0_config as pi0_config
+
+    t0 = time.time()
+    model_cfg = pi0_config.Pi0Config(
+        pi05=True,
+        action_dim=cfg.get("model_action_dim", 32),
+        action_horizon=cfg.get("horizon_steps", 32),
+        max_token_len=cfg.get("ae_max_token_len", cfg.get("max_token_len", 64)),
+        paligemma_variant=cfg.get("paligemma_variant", "gemma_2b"),
+        action_expert_variant=cfg.get("action_expert_variant", "gemma_300m"),
+        dtype=cfg.get("precision", "bfloat16"),
+    )
+    with skip_init_weights():
+        model = PI0WaypointJoint(
+            config=model_cfg,
+            vlm_max_token_len=cfg.get("vlm_max_token_len", cfg.get("max_token_len", 256)),
+            gradient_strategy="none",
+        )
+    logger.info(f"Joint model init: {time.time() - t0:.1f}s")
+
+    ckpt_path = cfg["joint_checkpoint"]
+    ckpt_file = os.path.join(ckpt_path, "model.safetensors")
+    logger.info(f"Loading joint model from {ckpt_path}")
+    t0 = time.time()
+    PI0WaypointJoint.load_pretrained_weights(model, ckpt_file, "cpu")
+    logger.info(f"Joint weight load: {time.time() - t0:.1f}s")
+
+    t0 = time.time()
+    model = model.to(device).eval()
+    logger.info(f"Joint model to {device}: {time.time() - t0:.1f}s")
+
+    _apply_sdpa(model.paligemma_with_expert.paligemma.model.language_model, "Joint paligemma")
+    _apply_sdpa(model.paligemma_with_expert.gemma_expert.model, "Joint gemma_expert")
+
+    if cfg.get("torch_compile", False):
+        _apply_compile(
+            model.paligemma_with_expert.gemma_expert, "model", "Joint gemma_expert",
+        )
+
+    return model
+
+
 # ---------------------------------------------------------------------------
 # Inference helpers
 # ---------------------------------------------------------------------------
@@ -553,9 +602,16 @@ def evaluate(cfg):
     logger.info(f"Device: {device}")
 
     t_total = time.time()
-    vlm = load_vlm(cfg, device)
-    ae_model = load_ae(cfg, device)
-    logger.info(f"Total model loading: {time.time() - t_total:.1f}s")
+    use_joint = "joint_checkpoint" in cfg
+    if use_joint:
+        joint_model = load_joint(cfg, device)
+        vlm = joint_model      # generate_waypoints() lives on joint model
+        ae_model = joint_model  # sample_actions() lives on joint model
+        logger.info(f"Joint model loaded (shared backbone): {time.time() - t_total:.1f}s")
+    else:
+        vlm = load_vlm(cfg, device)
+        ae_model = load_ae(cfg, device)
+        logger.info(f"Total model loading (separate VLM+AE): {time.time() - t_total:.1f}s")
 
     t0 = time.time()
     pg_tok = load_pg_tokenizer()
