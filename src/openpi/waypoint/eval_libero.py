@@ -106,17 +106,17 @@ def get_libero_images(env, obs, size=224):
             img = img.resize((size, size), PILImage.BILINEAR)
         images["left_wrist_0_rgb"] = np.array(img, dtype=np.uint8)
 
-    if _image_save_dir is not None and images:
-        frames = []
-        if "base_0_rgb" in images:
-            frames.append(images["base_0_rgb"])
-        if "left_wrist_0_rgb" in images:
-            frames.append(images["left_wrist_0_rgb"])
-        if frames:
-            combined = np.concatenate(frames, axis=1)
-            save_path = pathlib.Path(_image_save_dir) / f"frame_{_image_frame_idx:06d}.png"
-            PILImage.fromarray(combined).save(str(save_path))
-            _image_frame_idx += 1
+    # if _image_save_dir is not None and images:
+    #     frames = []
+    #     if "base_0_rgb" in images:
+    #         frames.append(images["base_0_rgb"])
+    #     if "left_wrist_0_rgb" in images:
+    #         frames.append(images["left_wrist_0_rgb"])
+    #     if frames:
+    #         combined = np.concatenate(frames, axis=1)
+    #         save_path = pathlib.Path(_image_save_dir) / f"frame_{_image_frame_idx:06d}.png"
+    #         PILImage.fromarray(combined).save(str(save_path))
+    #         _image_frame_idx += 1
 
     return images
 
