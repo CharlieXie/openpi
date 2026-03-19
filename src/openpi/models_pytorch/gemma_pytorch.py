@@ -96,6 +96,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
+        knowledge_insulation: bool = False,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
@@ -176,6 +177,14 @@ class PaliGemmaWithExpertModel(nn.Module):
                     query_states.append(query_state)
                     key_states.append(key_state)
                     value_states.append(value_state)
+
+                # Knowledge Insulation (Pi0.5 §5.2): detach backbone K/V so that
+                # flow-matching MSE loss cannot update backbone weights through
+                # the cross-attention path (expert attending to backbone tokens).
+                # Equivalent to sg(K_b) and sg(V_b) in equations (5) and (6).
+                if knowledge_insulation:
+                    key_states[0] = key_states[0].detach()
+                    value_states[0] = value_states[0].detach()
 
                 # Concatenate and process attention
                 query_states = torch.cat(query_states, dim=2)

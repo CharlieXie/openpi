@@ -6,8 +6,9 @@ Shares a single PaliGemma backbone between:
 
 Gradient strategy options:
   - "none": both losses freely update all parameters
-  - "stop_gradient": detach prefix embeddings in AE forward so MSE loss
-    does not flow gradients into the shared backbone
+  - "stop_gradient": Knowledge Insulation (Pi0.5 §5.2) — detach backbone
+    K/V inside every attention layer so MSE loss cannot update backbone
+    weights through cross-attention. Backbone only receives VLM CE gradients.
   - "freeze_backbone": freeze all paligemma backbone parameters entirely
 """
 
@@ -339,10 +340,6 @@ class PI0WaypointJoint(nn.Module):
 
         prefix_embs, prefix_pad, prefix_att = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
 
-        # --- stop_gradient: detach prefix to block MSE -> backbone ---
-        if self.gradient_strategy == "stop_gradient":
-            prefix_embs = prefix_embs.detach()
-
         suffix_embs, suffix_pad, suffix_att, adarms_cond = self.embed_suffix(
             start_proprio, end_proprio, x_t, time, duration,
         )
@@ -359,6 +356,11 @@ class PI0WaypointJoint(nn.Module):
         att_4d = att_2d[:, None, :, :]
         att_4d = torch.where(att_4d, 0.0, -2.3819763e38)
 
+        # Knowledge Insulation: when stop_gradient is enabled, detach backbone
+        # K/V inside every attention layer so MSE loss cannot update backbone
+        # weights. See Pi0.5 paper §5.2, equations (5) and (6).
+        use_ki = self.gradient_strategy == "stop_gradient"
+
         (_, suffix_out), _ = self.paligemma_with_expert.forward(
             attention_mask=att_4d,
             position_ids=position_ids,
@@ -366,6 +368,7 @@ class PI0WaypointJoint(nn.Module):
             inputs_embeds=[prefix_embs, suffix_embs],
             use_cache=False,
             adarms_cond=[None, adarms_cond],
+            knowledge_insulation=use_ki,
         )
 
         suffix_out = suffix_out[:, -self.action_horizon:].float()

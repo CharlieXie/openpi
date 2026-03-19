@@ -653,19 +653,33 @@ VLM CE loss ──backprop──► backbone ◄──backprop── AE MSE loss
 
 两种 loss 梯度自由流入 backbone 所有参数。最简单，但可能导致梯度冲突——CE 和 MSE 优化目标不同，可能让 backbone 在两个方向间震荡。
 
-#### `"stop_gradient"` — Detach AE prefix
+#### `"stop_gradient"` — Knowledge Insulation (Pi0.5 §5.2)
 
 ```
-VLM CE loss ──backprop──► backbone ──forward──► prefix_embs.detach() ──► AE
-                                                     ↑
-                                                  梯度阻断
+每一层 attention 中:
+
+  Backbone:  Q_b, K_b, V_b  ──正常计算──► attn_output_b (不参与 MSE loss)
+  Expert:    Q_a, sg(K_b), sg(V_b), K_a, V_a  ──► attn_output_a ──► MSE loss
+                   ↑          ↑
+              梯度阻断     梯度阻断
 ```
 
-在 `ae_forward()` 中，`embed_prefix()` 返回后执行 `prefix_embs = prefix_embs.detach()`。
+在 `ae_forward()` 中，通过 `knowledge_insulation=True` 传递给 `paligemma_with_expert.forward()`。
+在 `gemma_pytorch.py` 的 `compute_layer_complete` 中，每层 attention 计算前对 backbone 的 K 和 V 施加 detach：
 
-**原理**：AE 的 attention mask 设计决定了 prefix tokens (`ar_mask=0`) 不 attend to suffix tokens。因此 detach `prefix_embs` 完全阻断 MSE 梯度流向 backbone，而 AE expert、proprio_encoder、time_mlp 等 AE 专用层仍正常更新。
+```python
+if knowledge_insulation:
+    key_states[0] = key_states[0].detach()    # sg(K_b)
+    value_states[0] = value_states[0].detach()  # sg(V_b)
+```
 
-**效果**：backbone 只接收 VLM CE 梯度，AE 只更新 expert + projection 层。
+**对应论文公式 (5)**：`Q_a(X_a) @ sg(K_b(X_b))^T` — expert 的 query 可以 attend to backbone 的 key，但梯度不流回 backbone 的 `k_proj` 权重。
+
+**对应论文公式 (6)**：`P_ab @ sg(V_b(X_b))` — expert 可以读取 backbone 的 value 表征，但梯度不流回 backbone 的 `v_proj` 权重。
+
+**为什么全局 detach K_b/V_b 等价于论文的 selective sg**：attention mask 设计决定了 backbone 输出 `attn_output_b` 不参与 MSE loss 路径（prefix tokens 不出现在 action prediction 中）。因此 backbone attention 的 Q_b @ K_b^T 路径上的 detach 是无害的——该路径上原本就没有 MSE 梯度。
+
+**效果**：backbone 只接收 VLM CE 梯度，AE 仅更新 expert + projection 层（proprio_encoder、time_mlp、action_in/out_proj）。与旧版 `prefix_embs.detach()` 相比，新方法彻底阻断了 MSE 梯度通过 backbone 层权重（q/k/v/o_proj、MLP）的路径。
 
 #### `"freeze_backbone"` — 冻结 backbone
 
