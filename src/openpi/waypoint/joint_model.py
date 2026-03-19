@@ -675,15 +675,26 @@ class PI0WaypointJoint(nn.Module):
 
         state_dict = safetensors.torch.load_file(weight_path, device=str(device))
         own_state = model.state_dict()
-        loaded, skipped = 0, 0
+        loaded, skipped, partial = 0, 0, 0
         for name, param in state_dict.items():
             if name not in own_state:
                 skipped += 1
                 continue
             if own_state[name].shape != param.shape:
-                logger.info(f"  Skipping {name}: shape {param.shape} != {own_state[name].shape}")
-                skipped += 1
+                if param.dim() == own_state[name].dim() and all(
+                    ps <= ns for ps, ns in zip(param.shape, own_state[name].shape)
+                ):
+                    slices = tuple(slice(0, s) for s in param.shape)
+                    own_state[name][slices].copy_(param)
+                    logger.info(
+                        f"  Partial load {name}: pretrained {tuple(param.shape)} "
+                        f"-> new {tuple(own_state[name].shape)} (preserved pretrained region)"
+                    )
+                    partial += 1
+                else:
+                    logger.info(f"  Skipping {name}: shape {param.shape} != {own_state[name].shape}")
+                    skipped += 1
                 continue
             own_state[name].copy_(param)
             loaded += 1
-        logger.info(f"Loaded {loaded} weight tensors, skipped {skipped}")
+        logger.info(f"Loaded {loaded} weight tensors, {partial} partial, skipped {skipped}")

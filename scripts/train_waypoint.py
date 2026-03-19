@@ -55,9 +55,8 @@ def setup_ddp():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     use_ddp = world_size > 1
     if use_ddp and not dist.is_initialized():
-        # Use gloo — nccl has compatibility issues in this environment
-        # (matches the behaviour of the existing train_pytorch.py)
-        backend = "gloo"
+        # Requires nvidia-nccl-cu12>=2.29 for Blackwell (sm_120) multi-GPU support.
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
         dist.init_process_group(backend=backend, init_method="env://")
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
@@ -193,22 +192,31 @@ def train_ae(cfg, device, use_ddp, is_main):
     if cfg.get("pretrained_weight_path"):
         logging.info(f"Loading pretrained weights from {cfg['pretrained_weight_path']}")
         weight_path = os.path.join(cfg["pretrained_weight_path"], "model.safetensors")
-        # time_mlp_in is intentionally resized from [W,W] → [2W,W] to accept
-        # cat(time_emb, dur_emb). Skip it during weight loading and keep random init.
         state_dict = safetensors.torch.load_file(weight_path, device=str(device))
         own_state = model.state_dict()
-        loaded, skipped = 0, 0
+        loaded, skipped, partial = 0, 0, 0
         for name, param in state_dict.items():
             if name not in own_state:
                 skipped += 1
                 continue
             if own_state[name].shape != param.shape:
-                logging.info(f"  Skipping {name}: shape {param.shape} != {own_state[name].shape}")
-                skipped += 1
+                if param.dim() == own_state[name].dim() and all(
+                    ps <= ns for ps, ns in zip(param.shape, own_state[name].shape)
+                ):
+                    slices = tuple(slice(0, s) for s in param.shape)
+                    own_state[name][slices].copy_(param)
+                    logging.info(
+                        f"  Partial load {name}: pretrained {tuple(param.shape)} "
+                        f"-> new {tuple(own_state[name].shape)} (preserved pretrained region)"
+                    )
+                    partial += 1
+                else:
+                    logging.info(f"  Skipping {name}: shape {param.shape} != {own_state[name].shape}")
+                    skipped += 1
                 continue
             own_state[name].copy_(param)
             loaded += 1
-        logging.info(f"Loaded {loaded} weight tensors, skipped {skipped}")
+        logging.info(f"Loaded {loaded} weight tensors, {partial} partial, skipped {skipped}")
         if is_main:
             log_gpu_memory(device, prefix="[After weight load] ")
 

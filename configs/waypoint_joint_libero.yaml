@@ -33,17 +33,17 @@ stride: 1
 pretrained_weight_path: /workspace/models/pi05_base_pytorch
 
 # --- Joint training ---
-gradient_strategy: none        # "none" | "stop_gradient" | "freeze_backbone"
+gradient_strategy: stop_gradient        # "none" | "stop_gradient" | "freeze_backbone"
 ae_loss_weight: 1.0
 
 # Batch sizes (per GPU)
-vlm_batch_size: 24
-ae_batch_size: 24
+vlm_batch_size: 22
+ae_batch_size: 22
 
 # Training hyperparameters
-num_train_steps: 20000
+num_train_steps: 10000
 warmup_steps: 400
-peak_lr: 9.0e-5
+peak_lr: 6.0e-5
 end_lr: 1.0e-7
 
 # Normalization
@@ -76,7 +76,7 @@ ae_shuffle_buffer_size: 1000
 # Logging and checkpointing
 exp_name: waypoint_joint_libero_01
 checkpoint_dir: checkpoints/{exp_name}
-save_interval: 1500
+save_interval: 1000
 log_interval: 20
 wandb_enabled: true
 wandb_project: waypoint_e2e
