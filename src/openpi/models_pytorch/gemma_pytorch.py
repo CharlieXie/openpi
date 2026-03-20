@@ -96,7 +96,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
-        knowledge_insulation: bool = False,
+        knowledge_insulation: bool | float = False,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
@@ -178,13 +178,20 @@ class PaliGemmaWithExpertModel(nn.Module):
                     key_states.append(key_state)
                     value_states.append(value_state)
 
-                # Knowledge Insulation (Pi0.5 §5.2): detach backbone K/V so that
-                # flow-matching MSE loss cannot update backbone weights through
-                # the cross-attention path (expert attending to backbone tokens).
-                # Equivalent to sg(K_b) and sg(V_b) in equations (5) and (6).
+                # Knowledge Insulation (Pi0.5 §5.2): control gradient flow from
+                # AE MSE loss into backbone weights through cross-attention.
+                #   - True:  full detach (original KI, sg(K_b) / sg(V_b))
+                #   - float in (0,1): gradient scaling — let that fraction of
+                #     AE gradient flow into backbone K/V projections
+                #   - False/0: no insulation
                 if knowledge_insulation:
-                    key_states[0] = key_states[0].detach()
-                    value_states[0] = value_states[0].detach()
+                    if isinstance(knowledge_insulation, float) and 0 < knowledge_insulation < 1:
+                        scale = knowledge_insulation
+                        key_states[0] = key_states[0] * scale + key_states[0].detach() * (1 - scale)
+                        value_states[0] = value_states[0] * scale + value_states[0].detach() * (1 - scale)
+                    else:
+                        key_states[0] = key_states[0].detach()
+                        value_states[0] = value_states[0].detach()
 
                 # Concatenate and process attention
                 query_states = torch.cat(query_states, dim=2)

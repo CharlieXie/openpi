@@ -108,6 +108,7 @@ def train_joint(cfg, device, use_ddp, is_main):
         config=model_cfg,
         vlm_max_token_len=cfg.get("vlm_max_token_len", 256),
         gradient_strategy=cfg.get("gradient_strategy", "none"),
+        gradient_scale=cfg.get("gradient_scale", 0.1),
         aug_cfg=cfg.get("ae_image_aug_cfg", None),
     ).to(device)
     model.gradient_checkpointing_enable()
@@ -173,12 +174,13 @@ def train_joint(cfg, device, use_ddp, is_main):
     log_interval = cfg.get("log_interval", 5)
     ae_loss_weight = cfg.get("ae_loss_weight", 1.0)
     gradient_strategy = cfg.get("gradient_strategy", "none")
+    gradient_scale = cfg.get("gradient_scale", 0.1)
 
     if is_main:
         init_lr = peak_lr / (warmup + 1)
         logging.info(f"LR schedule: init={init_lr:.2e} -> peak={peak_lr:.2e} (warmup {warmup} steps) -> end={end_lr:.2e} (cosine over {decay_steps} steps)")
         logging.info(f"Training: {global_step} -> {num_steps} steps  |  save every {save_interval}  |  log every {log_interval}")
-        logging.info(f"Gradient strategy: {gradient_strategy}  |  AE loss weight: {ae_loss_weight}")
+        logging.info(f"Gradient strategy: {gradient_strategy}  |  AE loss weight: {ae_loss_weight}  |  Gradient scale: {gradient_scale}")
 
     resuming = cfg.get("resume", False)
     init_wandb(cfg, "joint", is_main, resuming=resuming)
@@ -191,6 +193,7 @@ def train_joint(cfg, device, use_ddp, is_main):
             wandb.run.summary["trainable_params"] = trainable_p
             wandb.run.summary["gradient_strategy"] = gradient_strategy
             wandb.run.summary["ae_loss_weight"] = ae_loss_weight
+            wandb.run.summary["gradient_scale"] = gradient_scale
 
     # --- Training loop ---
     model.train()

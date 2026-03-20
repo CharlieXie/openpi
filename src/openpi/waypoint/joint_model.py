@@ -9,6 +9,10 @@ Gradient strategy options:
   - "stop_gradient": Knowledge Insulation (Pi0.5 §5.2) — detach backbone
     K/V inside every attention layer so MSE loss cannot update backbone
     weights through cross-attention. Backbone only receives VLM CE gradients.
+  - "scale_gradient": Soft KI — scale (not detach) AE gradients flowing
+    into backbone K/V by ``gradient_scale`` (e.g. 0.1 = 10% of AE gradient
+    reaches backbone). Lets backbone slowly adapt to AE needs while VLM CE
+    remains the dominant training signal.
   - "freeze_backbone": freeze all paligemma backbone parameters entirely
 """
 
@@ -51,15 +55,17 @@ class PI0WaypointJoint(nn.Module):
         config,
         vlm_max_token_len: int = 256,
         gradient_strategy: str = "none",
+        gradient_scale: float = 0.1,
         aug_cfg: dict | None = None,
     ):
         super().__init__()
-        assert gradient_strategy in ("none", "stop_gradient", "freeze_backbone"), (
+        assert gradient_strategy in ("none", "stop_gradient", "scale_gradient", "freeze_backbone"), (
             f"Unknown gradient_strategy: {gradient_strategy}"
         )
         self.config = config
         self.vlm_max_token_len = vlm_max_token_len
         self.gradient_strategy = gradient_strategy
+        self.gradient_scale = gradient_scale
         self.aug_cfg = aug_cfg
         self.action_horizon = config.action_horizon
         self.action_dim = config.action_dim
@@ -96,14 +102,19 @@ class PI0WaypointJoint(nn.Module):
     # ------------------------------------------------------------------
     def gradient_checkpointing_enable(self):
         self.gradient_checkpointing_enabled = True
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
+        # VLM path: use HF API so that the inner GemmaModel / SiglipEncoder
+        # (which actually check the flag) get gradient_checkpointing=True.
+        # Just setting the attribute on the outer wrapper does NOT propagate.
+        self.paligemma_with_expert.paligemma.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        # AE path: the custom paligemma_with_expert.forward() uses its own
+        # torch.utils.checkpoint.checkpoint() calls, keyed off this attribute.
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
 
     def gradient_checkpointing_disable(self):
         self.gradient_checkpointing_enabled = False
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = False
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
+        self.paligemma_with_expert.paligemma.gradient_checkpointing_disable()
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
 
     def _ckpt(self, func, *args, **kwargs):
@@ -356,10 +367,17 @@ class PI0WaypointJoint(nn.Module):
         att_4d = att_2d[:, None, :, :]
         att_4d = torch.where(att_4d, 0.0, -2.3819763e38)
 
-        # Knowledge Insulation: when stop_gradient is enabled, detach backbone
-        # K/V inside every attention layer so MSE loss cannot update backbone
-        # weights. See Pi0.5 paper §5.2, equations (5) and (6).
-        use_ki = self.gradient_strategy == "stop_gradient"
+        # Knowledge Insulation: control gradient flow from AE MSE loss into
+        # backbone weights through cross-attention K/V.
+        #   - "stop_gradient": full detach (True)
+        #   - "scale_gradient": partial gradient (float scale in (0,1))
+        #   - "none" / "freeze_backbone": no insulation (False)
+        if self.gradient_strategy == "stop_gradient":
+            ki_value: bool | float = True
+        elif self.gradient_strategy == "scale_gradient":
+            ki_value = self.gradient_scale
+        else:
+            ki_value = False
 
         (_, suffix_out), _ = self.paligemma_with_expert.forward(
             attention_mask=att_4d,
@@ -368,7 +386,7 @@ class PI0WaypointJoint(nn.Module):
             inputs_embeds=[prefix_embs, suffix_embs],
             use_cache=False,
             adarms_cond=[None, adarms_cond],
-            knowledge_insulation=use_ki,
+            knowledge_insulation=ki_value,
         )
 
         suffix_out = suffix_out[:, -self.action_horizon:].float()
