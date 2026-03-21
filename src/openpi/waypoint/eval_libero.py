@@ -339,8 +339,13 @@ def load_joint(cfg, device):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def predict_waypoints(vlm, images, instruction, wp_tokenizer, state_norm, device):
-    """VLM autoregressive waypoint prediction."""
+def predict_waypoints(vlm, images, instruction, wp_tokenizer, state_continuous_norm, gripper_binary, device):
+    """VLM autoregressive waypoint prediction.
+
+    Args:
+        state_continuous_norm: normalized continuous proprio (e.g. 6D for LIBERO).
+        gripper_binary: 0=close, 1=open.
+    """
     img_tensors = {}
     img_masks = {}
     for key, arr in images.items():
@@ -353,11 +358,18 @@ def predict_waypoints(vlm, images, instruction, wp_tokenizer, state_norm, device
             img_tensors[model_key] = torch.zeros(1, 224, 224, 3, device=device)
             img_masks[model_key] = torch.zeros(1, dtype=torch.bool, device=device)
 
+    from openpi.waypoint.tokenizer import PROPRIO_N_BINS
+
     proprio_dim = wp_tokenizer.proprio_dim
-    state_for_prompt = state_norm[:proprio_dim]
-    prompt_text = f"Task: {instruction.strip().replace('_', ' ').lower()}, State: "
-    discretized = np.digitize(np.clip(state_for_prompt, -1, 1), np.linspace(-1, 1, 257)[:-1]) - 1
-    prompt_text += " ".join(map(str, discretized.astype(int))) + ";\n"
+    state_for_prompt = state_continuous_norm[:proprio_dim]
+    discretized = np.digitize(np.clip(state_for_prompt, -1, 1), np.linspace(-1, 1, PROPRIO_N_BINS + 1)[:-1]) - 1
+    state_str = " ".join(map(str, discretized.astype(int)))
+
+    if wp_tokenizer.use_gripper_token:
+        grip_str = "open" if gripper_binary else "closed"
+        prompt_text = f"Task: {instruction.strip().replace('_', ' ').lower()}, State: {state_str}, Gripper: {grip_str};\n"
+    else:
+        prompt_text = f"Task: {instruction.strip().replace('_', ' ').lower()}, State: {state_str};\n"
 
     prompt_tokens_list = wp_tokenizer._pg_tokenizer.encode(prompt_text, add_bos=True)
     prompt_tokens = torch.tensor([prompt_tokens_list], dtype=torch.long, device=device)
@@ -497,11 +509,15 @@ def run_episode(
 
         images = get_libero_images(env, obs)
         proprio_raw = get_proprio_from_obs(obs)
-        proprio_norm = norm_helper.normalize_proprio(proprio_raw)
-        state_padded = pad_to_dim(proprio_norm, model_proprio_dim)
+        # Split into continuous + binary gripper
+        continuous_raw, gripper_binary = rc.split_proprio(proprio_raw)
+        continuous_norm = norm_helper.normalize_proprio(continuous_raw)
 
         t_vlm = time.time()
-        waypoints = predict_waypoints(vlm, images, task_desc, wp_tokenizer, state_padded, device)
+        waypoints = predict_waypoints(
+            vlm, images, task_desc, wp_tokenizer,
+            continuous_norm, gripper_binary, device,
+        )
         vlm_ms = (time.time() - t_vlm) * 1000
 
         replan_count += 1
@@ -518,11 +534,14 @@ def run_episode(
         for wi, (pv, dur) in enumerate(waypoints):
             logger.info(f"    wp[{wi}]: proprio={_fmt_array(pv, 6)}, duration={dur}")
 
-        start_wp = state_padded.copy()
+        # Build 7D start_wp: [continuous_norm(6D), gripper_binary(1D)]
+        start_wp_7d = np.concatenate([continuous_norm, [float(gripper_binary)]])
+        start_wp = pad_to_dim(start_wp_7d, model_proprio_dim)
         steps_this_cycle = 0
 
         max_dur = cfg.get("horizon_steps", 32)
         for wp_idx, (proprio_values, duration) in enumerate(waypoints):
+            # proprio_values is 7D: [6D continuous_norm, 1D gripper_binary]
             if duration == 0:
                 break
             if done:
@@ -624,9 +643,10 @@ def evaluate(cfg):
         norm_helper.action_norm_mask = rc.action_norm_mask
 
     wp_tokenizer = WaypointTokenizer(
-        proprio_dim=rc.actual_proprio_dim,
+        proprio_dim=rc.continuous_proprio_dim,
         num_waypoints=cfg.get("num_waypoints", 7),
         max_token_len=cfg.get("max_token_len", 256),
+        use_gripper_token=True,
     )
 
     video_out_path = pathlib.Path(cfg.get("video_out_path", "data/libero/videos"))

@@ -71,7 +71,9 @@ class WaypointAEDataset(IterableDataset):
             self.norm_helper.action_norm_mask = robot_config.action_norm_mask
 
         self.action_dim_mask = make_dim_mask(robot_config.actual_action_dim, model_action_dim)
-        self.proprio_dim_mask = make_dim_mask(robot_config.actual_proprio_dim, model_proprio_dim)
+        # AE proprio is continuous_proprio_dim + 1 (gripper binary) = action_dim
+        ae_proprio_dim = robot_config.continuous_proprio_dim + 1
+        self.proprio_dim_mask = make_dim_mask(ae_proprio_dim, model_proprio_dim)
 
         logger.info(f"Loading waypoint indices from {wp_indices_path}")
         with open(wp_indices_path) as f:
@@ -98,7 +100,7 @@ class WaypointAEDataset(IterableDataset):
             f"WaypointAEDataset: {len(self.episode_wp_map)} episodes, "
             f"{total_pairs} valid pairs, {skipped} skipped (dur>{max_duration}), "
             f"actual_action={robot_config.actual_action_dim}→{model_action_dim}, "
-            f"actual_proprio={robot_config.actual_proprio_dim}→{model_proprio_dim}"
+            f"proprio={robot_config.continuous_proprio_dim}+1grip={ae_proprio_dim}→{model_proprio_dim}"
         )
 
     def __len__(self) -> int:
@@ -170,14 +172,17 @@ class WaypointAEDataset(IterableDataset):
                         rc.state_obs_keys,
                     )
 
-                    start_proprio = pad_to_dim(
-                        self.norm_helper.normalize_proprio(start_proprio_raw),
-                        self.model_proprio_dim,
-                    )
-                    end_proprio = pad_to_dim(
-                        self.norm_helper.normalize_proprio(end_proprio_raw),
-                        self.model_proprio_dim,
-                    )
+                    # Split into continuous dims + binary gripper, normalize
+                    # continuous, then reassemble as 7D: [continuous_norm, grip_binary]
+                    start_cont, start_grip = rc.split_proprio(start_proprio_raw)
+                    end_cont, end_grip = rc.split_proprio(end_proprio_raw)
+                    start_cont_norm = self.norm_helper.normalize_proprio(start_cont)
+                    end_cont_norm = self.norm_helper.normalize_proprio(end_cont)
+                    start_7d = np.concatenate([start_cont_norm, [float(start_grip)]])
+                    end_7d = np.concatenate([end_cont_norm, [float(end_grip)]])
+
+                    start_proprio = pad_to_dim(start_7d, self.model_proprio_dim)
+                    end_proprio = pad_to_dim(end_7d, self.model_proprio_dim)
 
                     seg_actions = all_actions[w_start:w_end]
                     actual_len = len(seg_actions)

@@ -33,6 +33,8 @@ from openpi.models_pytorch.pi0_pytorch import (
 from openpi.waypoint.ae_model import DURATION_MAX
 from openpi.waypoint.tokenizer import (
     _DURATION_BASE,
+    _GRIP_CLOSE_ID,
+    _GRIP_OPEN_ID,
     _PROPRIO_BASE,
     DURATION_N_BINS,
     PROPRIO_N_BINS,
@@ -493,16 +495,30 @@ class PI0WaypointJoint(nn.Module):
         duration_lo = _DURATION_BASE - DURATION_N_BINS + 1
         duration_hi = _DURATION_BASE
 
+        # Pre-compute position constants from tokenizer
+        grip_pos = wp_tokenizer.gripper_pos_in_wp
+        dur_delim_pos = wp_tokenizer.dur_delimiter_pos_in_wp
+        dur_val_pos = wp_tokenizer.duration_pos_in_wp
+        use_grip = wp_tokenizer.use_gripper_token
+
         for step in range(max_new_tokens):
+            # --- Logit masking (constrained decoding) ---
             for b in range(B):
                 if header_injected[b]:
                     wp_count = len(all_output_tokens[b])
                     pos_in_wp = wp_count % tpw
                     is_proprio_pos = 1 <= pos_in_wp <= wp_tokenizer.proprio_dim
-                    is_duration_pos = pos_in_wp == wp_tokenizer.proprio_dim + 2
+                    is_gripper_pos = use_grip and pos_in_wp == grip_pos
+                    is_duration_pos = pos_in_wp == dur_val_pos
+
                     if is_proprio_pos:
                         mask_val = torch.full((vocab_size,), float('-inf'), device=device)
                         mask_val[proprio_lo : proprio_hi + 1] = 0.0
+                        last_logits[b, 0] += mask_val
+                    elif is_gripper_pos:
+                        mask_val = torch.full((vocab_size,), float('-inf'), device=device)
+                        mask_val[_GRIP_OPEN_ID] = 0.0
+                        mask_val[_GRIP_CLOSE_ID] = 0.0
                         last_logits[b, 0] += mask_val
                     elif is_duration_pos:
                         mask_val = torch.full((vocab_size,), float('-inf'), device=device)
@@ -515,6 +531,7 @@ class PI0WaypointJoint(nn.Module):
             else:
                 next_token = torch.argmax(last_logits[:, 0], dim=-1, keepdim=True)
 
+            # --- Force-inject structural delimiters ---
             for b in range(B):
                 if not header_injected[b]:
                     if header_pos[b] < len(action_header):
@@ -529,7 +546,7 @@ class PI0WaypointJoint(nn.Module):
 
                 if pos_in_wp == 0:
                     next_token[b, 0] = wp_tokenizer.wp_token_id
-                elif pos_in_wp == wp_tokenizer.proprio_dim + 1:
+                elif pos_in_wp == dur_delim_pos:
                     next_token[b, 0] = wp_tokenizer.dur_token_id
 
                 all_output_tokens[b].append(next_token[b, 0].item())
@@ -563,19 +580,19 @@ class PI0WaypointJoint(nn.Module):
             tids = all_output_tokens[b]
             n_proprio_ok = sum(
                 1 for i, t in enumerate(tids)
-                if (i % tpw) >= 1 and (i % tpw) <= wp_tokenizer.proprio_dim
+                if 1 <= (i % tpw) <= wp_tokenizer.proprio_dim
                 and proprio_lo <= t <= proprio_hi
             )
             n_duration_ok = sum(
                 1 for i, t in enumerate(tids)
-                if (i % tpw) == wp_tokenizer.proprio_dim + 2
+                if (i % tpw) == dur_val_pos
                 and duration_lo <= t <= duration_hi
             )
             n_proprio_total = sum(
-                1 for i in range(len(tids)) if (i % tpw) >= 1 and (i % tpw) <= wp_tokenizer.proprio_dim
+                1 for i in range(len(tids)) if 1 <= (i % tpw) <= wp_tokenizer.proprio_dim
             )
             n_duration_total = sum(
-                1 for i in range(len(tids)) if (i % tpw) == wp_tokenizer.proprio_dim + 2
+                1 for i in range(len(tids)) if (i % tpw) == dur_val_pos
             )
             if n_proprio_total > 0 or n_duration_total > 0:
                 logger.debug(

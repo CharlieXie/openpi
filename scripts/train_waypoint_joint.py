@@ -52,9 +52,10 @@ def train_joint(cfg, device, use_ddp, is_main):
 
     # --- Datasets ---
     wp_tokenizer = WaypointTokenizer(
-        proprio_dim=rc.actual_proprio_dim,
+        proprio_dim=rc.continuous_proprio_dim,
         num_waypoints=cfg.get("num_waypoints", 7),
         max_token_len=cfg.get("vlm_max_token_len", 256),
+        use_gripper_token=True,
     )
 
     vlm_dataset = WaypointVLMDataset(

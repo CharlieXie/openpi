@@ -123,24 +123,46 @@ class RobotConfig:
 
     # Actual dimensions before padding
     actual_action_dim: int
-    actual_proprio_dim: int
+    actual_proprio_dim: int  # total raw state dims (e.g. 8 for LIBERO)
+
+    # Continuous proprio dims (excluding gripper) for VLM tokenization
+    continuous_proprio_dim: int = 6
+
+    # Gripper binarization settings for VLM waypoint tokens
+    gripper_dim_index: int = 6  # index in raw state for gripper binarization
+    gripper_threshold: float = 0.02  # > threshold = open
 
     # Indices into the raw RLDS action array
-    action_dim_indices: list[int]
+    action_dim_indices: list[int] = field(default_factory=list)
 
     # Observation keys for extracting proprio from RLDS
-    state_obs_keys: list[str]
+    state_obs_keys: list[str] = field(default_factory=list)
 
     # Camera views and their RLDS keys
-    camera_views: list[str]
-    camera_rlds_keys: dict[str, str]
-    camera_model_keys: dict[str, str]
+    camera_views: list[str] = field(default_factory=list)
+    camera_rlds_keys: dict[str, str] = field(default_factory=dict)
+    camera_model_keys: dict[str, str] = field(default_factory=dict)
 
-    # Gripper normalization function
-    normalize_gripper: Callable[[np.ndarray], np.ndarray]
+    # Gripper normalization function (for action processing)
+    normalize_gripper: Callable[[np.ndarray], np.ndarray] = field(default=lambda x: x)
 
     # Normalization mask for actions (False = skip normalization, e.g. gripper)
     action_norm_mask: np.ndarray | None = None
+
+    def binarize_gripper(self, state: np.ndarray) -> int:
+        """Binarize gripper from raw state: 1=open, 0=close."""
+        return int(state[self.gripper_dim_index] > self.gripper_threshold)
+
+    def split_proprio(self, state: np.ndarray) -> tuple[np.ndarray, int]:
+        """Split raw state into continuous proprio and binary gripper.
+
+        Returns:
+            (continuous_proprio, gripper_binary): continuous is the first
+            ``continuous_proprio_dim`` dimensions, gripper is 0 or 1.
+        """
+        continuous = state[:self.continuous_proprio_dim].copy()
+        gripper = self.binarize_gripper(state)
+        return continuous, gripper
 
 
 def make_libero_config() -> RobotConfig:
@@ -151,6 +173,9 @@ def make_libero_config() -> RobotConfig:
         robot_type="libero",
         actual_action_dim=7,
         actual_proprio_dim=8,
+        continuous_proprio_dim=6,  # dims 0-5 (EEF xyz + rot)
+        gripper_dim_index=6,  # grip_qpos_L
+        gripper_threshold=0.02,  # > 0.02 → open
         action_dim_indices=action_dims,
         state_obs_keys=["state"],
         camera_views=["primary", "wrist"],

@@ -129,6 +129,7 @@ class WaypointVLMDataset(IterableDataset):
                     continue
 
                 all_proprios_raw = []
+                all_grippers = []
                 all_durations = []
                 all_is_end = []
                 for s in steps:
@@ -137,11 +138,15 @@ class WaypointVLMDataset(IterableDataset):
                         rc.state_obs_keys,
                     )
                     all_proprios_raw.append(proprio_raw)
+                    # Binarize gripper from raw state
+                    all_grippers.append(rc.binarize_gripper(proprio_raw))
                     all_durations.append(int(s["waypoint_duration"].numpy()))
                     all_is_end.append(bool(s.get("is_waypoint_end", s["is_last"]).numpy()))
 
-                all_proprios_norm = np.stack([
-                    self.norm_helper.normalize_proprio(p) for p in all_proprios_raw
+                # Normalize only continuous dims (exclude gripper)
+                all_proprios_continuous_norm = np.stack([
+                    self.norm_helper.normalize_proprio(p[:rc.continuous_proprio_dim])
+                    for p in all_proprios_raw
                 ])
 
                 instruction = steps[0]["language_instruction"].numpy()
@@ -154,13 +159,15 @@ class WaypointVLMDataset(IterableDataset):
                     if actual_wps < 1:
                         continue
 
-                    wp_proprios = np.zeros((M, rc.actual_proprio_dim), dtype=np.float32)
+                    wp_proprios = np.zeros((M, rc.continuous_proprio_dim), dtype=np.float32)
+                    wp_grippers = np.zeros(M, dtype=np.int32)
                     wp_durations = np.zeros(M, dtype=np.int32)
                     wp_pad_mask_proprio = np.ones(M, dtype=bool)
                     wp_pad_mask_duration = np.ones(M, dtype=bool)
 
                     for j in range(actual_wps):
-                        wp_proprios[j] = all_proprios_norm[start_idx + 1 + j]
+                        wp_proprios[j] = all_proprios_continuous_norm[start_idx + 1 + j]
+                        wp_grippers[j] = all_grippers[start_idx + 1 + j]
                         wp_pad_mask_proprio[j] = False
                         wp_durations[j] = all_durations[start_idx + j]
                         wp_pad_mask_duration[j] = False
@@ -171,13 +178,15 @@ class WaypointVLMDataset(IterableDataset):
                             wp_durations[actual_wps] = 0
                             wp_pad_mask_duration[actual_wps] = False
 
+                    # Pad continuous proprio to tokenizer's proprio_dim
                     wp_proprios_padded = np.zeros((M, self.wp_tokenizer.proprio_dim), dtype=np.float32)
-                    wp_proprios_padded[:, :rc.actual_proprio_dim] = wp_proprios
+                    wp_proprios_padded[:, :rc.continuous_proprio_dim] = wp_proprios
 
-                    current_proprio_raw = all_proprios_raw[start_idx]
-                    current_proprio_norm = self.norm_helper.normalize_proprio(current_proprio_raw)
+                    # Current state: continuous dims only
+                    current_continuous_norm = all_proprios_continuous_norm[start_idx]
                     state_padded = np.zeros(self.wp_tokenizer.proprio_dim, dtype=np.float32)
-                    state_padded[:len(current_proprio_norm)] = current_proprio_norm
+                    state_padded[:rc.continuous_proprio_dim] = current_continuous_norm
+                    current_gripper = all_grippers[start_idx]
 
                     images = {}
                     image_masks = {}
@@ -197,6 +206,8 @@ class WaypointVLMDataset(IterableDataset):
                         state=state_padded,
                         wp_proprios=wp_proprios_padded,
                         wp_durations=wp_durations,
+                        current_gripper=current_gripper,
+                        wp_grippers=wp_grippers,
                         wp_pad_mask_proprio=wp_pad_mask_proprio,
                         wp_pad_mask_duration=wp_pad_mask_duration,
                     )
@@ -210,7 +221,7 @@ class WaypointVLMDataset(IterableDataset):
                         "loss_mask": loss_mask,
                     }
 
-                del steps, all_proprios_raw, all_proprios_norm
+                del steps, all_proprios_raw, all_proprios_continuous_norm
                 gc.collect()
 
     def __iter__(self):
