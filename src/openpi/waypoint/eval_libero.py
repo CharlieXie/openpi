@@ -20,6 +20,7 @@ import json
 import logging
 import pathlib
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import imageio
@@ -970,38 +971,49 @@ def run_batch_episodes(
         ep.obs = env.set_init_state(init_state)
         episodes.append(ep)
 
-    # Wait steps (per episode, sequential — CPU only)
-    dummy_action = np.zeros(7)
-    for ep in episodes:
-        while ep.t < num_steps_wait:
-            ep.obs, _, ep.done, _ = ep.env.step(dummy_action)
+    # Wait steps (per episode, parallel threads — CPU only)
+    def _wait_episode(ep, n_wait):
+        dummy = np.zeros(7)
+        while ep.t < n_wait:
+            ep.obs, _, ep.done, _ = ep.env.step(dummy)
             ep.t += 1
             if ep.done:
                 ep.state = EpState.DONE
                 ep.success = True
                 break
 
+    with ThreadPoolExecutor(max_workers=len(episodes)) as wait_pool:
+        list(wait_pool.map(lambda ep: _wait_episode(ep, num_steps_wait), episodes))
+
     # Main scheduling loop
-    while any(ep.state != EpState.DONE for ep in episodes):
-        # Phase 1: Batch VLM for all episodes needing replan
-        vlm_eps = [ep for ep in episodes if ep.state == EpState.NEED_VLM]
-        if vlm_eps:
-            _batch_vlm_inference(vlm, vlm_eps, wp_tokenizer, norm_helper, cfg, device, max_steps_total)
+    with ThreadPoolExecutor(max_workers=len(episodes)) as executor:
+        while any(ep.state != EpState.DONE for ep in episodes):
+            # Phase 1: Batch VLM for all episodes needing replan
+            vlm_eps = [ep for ep in episodes if ep.state == EpState.NEED_VLM]
+            if vlm_eps:
+                _batch_vlm_inference(vlm, vlm_eps, wp_tokenizer, norm_helper, cfg, device, max_steps_total)
 
-        # Phase 2: Batch AE for all episodes needing action prediction
-        ae_eps = [ep for ep in episodes if ep.state == EpState.NEED_AE]
-        if ae_eps:
-            _batch_ae_inference(ae_model, ae_eps, cfg, device, pg_tok)
+            # Phase 2: Batch AE for all episodes needing action prediction
+            ae_eps = [ep for ep in episodes if ep.state == EpState.NEED_AE]
+            if ae_eps:
+                _batch_ae_inference(ae_model, ae_eps, cfg, device, pg_tok)
 
-        # Phase 3: Drain all EXECUTING episodes (CPU env.step only)
-        executing_eps = [ep for ep in episodes if ep.state == EpState.EXECUTING]
-        for ep in executing_eps:
-            _drain_episode_actions(ep, norm_helper, actual_action_dim, max_steps_total)
+            # Phase 3: Drain all EXECUTING episodes in parallel threads
+            executing_eps = [ep for ep in episodes if ep.state == EpState.EXECUTING]
+            if executing_eps:
+                futures = {
+                    executor.submit(
+                        _drain_episode_actions, ep, norm_helper, actual_action_dim, max_steps_total
+                    ): ep
+                    for ep in executing_eps
+                }
+                for future in futures:
+                    future.result()  # wait for all to complete
 
-        # Safety: break if no episode was actionable (should not happen)
-        if not vlm_eps and not ae_eps and not executing_eps:
-            logger.warning("Batch loop: no actionable episodes, breaking")
-            break
+            # Safety: break if no episode was actionable (should not happen)
+            if not vlm_eps and not ae_eps and not executing_eps:
+                logger.warning("Batch loop: no actionable episodes, breaking")
+                break
 
     for ep in episodes:
         logger.info(
