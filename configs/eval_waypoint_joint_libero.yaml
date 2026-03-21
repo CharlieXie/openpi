@@ -36,6 +36,7 @@ torch_compile: true
 # Evaluation
 num_trials_per_task: 10
 num_steps_wait: 10
+batch_size: 4  # number of concurrent trials per task (1 = serial, >1 = batch)
 
 # Video output
 video_out_path: data/libero/videos_wp_joint_object

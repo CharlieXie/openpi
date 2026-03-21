@@ -15,6 +15,7 @@ os.environ["NUMBA_DISABLE_JIT"] = "1"
 
 import argparse
 import contextlib
+import enum
 import json
 import logging
 import pathlib
@@ -594,6 +595,423 @@ def run_episode(
 
 
 # ---------------------------------------------------------------------------
+# Batch episode support
+# ---------------------------------------------------------------------------
+
+class EpState(enum.Enum):
+    NEED_VLM = "need_vlm"
+    NEED_AE = "need_ae"
+    EXECUTING = "executing"
+    DONE = "done"
+
+
+class BatchEpisode:
+    """Per-episode state for batch evaluation."""
+
+    def __init__(self, env, trial_idx, task_desc):
+        self.env = env
+        self.trial_idx = trial_idx
+        self.task_desc = task_desc
+        # Episode tracking
+        self.state = EpState.NEED_VLM
+        self.obs = None
+        self.t = 0
+        self.done = False
+        self.reward = 0.0
+        # VLM outputs
+        self.waypoints = []
+        self.wp_idx = 0
+        self.start_wp = None
+        self.current_end_wp = None
+        self.current_duration = 0
+        self.steps_this_cycle = 0
+        # AE outputs
+        self.action_buffer = None
+        self.action_idx = 0
+        self.num_execute = 0
+        # Recording
+        self.replay_images = []
+        self.replan_count = 0
+        self.success = False
+        # Cached normalized proprio (set by VLM phase)
+        self.state_padded = None
+
+
+def _collect_replay_frame(obs):
+    """Extract concatenated head+wrist replay frame from observation."""
+    agentview = obs.get("agentview_image", obs.get("agentview_rgb"))
+    if agentview is None:
+        return None
+    head_frame = np.ascontiguousarray(agentview[::-1, ::-1])
+    wrist_raw = obs.get("robot0_eye_in_hand_image", obs.get("robot0_eye_in_hand_rgb"))
+    if wrist_raw is not None:
+        wrist_frame = np.ascontiguousarray(wrist_raw[::-1, ::-1])
+        if wrist_frame.shape[0] != head_frame.shape[0]:
+            from PIL import Image as PILImage
+            wrist_frame = np.array(
+                PILImage.fromarray(wrist_frame).resize(
+                    (wrist_frame.shape[1], head_frame.shape[0]), PILImage.BILINEAR
+                )
+            )
+        return np.concatenate([head_frame, wrist_frame], axis=1)
+    return head_frame
+
+
+def _advance_to_valid_wp(ep):
+    """Advance ep.wp_idx to the next waypoint with duration > 0.
+
+    Returns True if a valid waypoint was found.
+    Returns False on duration == 0 (end signal) or list exhausted.
+    Skips waypoints with negative duration (same as original run_episode).
+    """
+    while ep.wp_idx < len(ep.waypoints):
+        _, dur = ep.waypoints[ep.wp_idx]
+        if dur == 0:
+            return False
+        if dur < 0:
+            logger.warning(f"    [ep{ep.trial_idx}] wp[{ep.wp_idx}]: negative duration {dur}, skipping")
+            ep.wp_idx += 1
+            continue
+        return True
+    return False
+
+
+@torch.no_grad()
+def _batch_vlm_inference(vlm, episodes, wp_tokenizer, norm_helper, cfg, device, max_steps_total):
+    """Batch VLM waypoint prediction for multiple episodes."""
+    model_proprio_dim = cfg.get("model_proprio_dim", 32)
+    max_dur = cfg.get("horizon_steps", 32)
+    actual_action_dim = get_robot_config("libero").actual_action_dim
+    B = len(episodes)
+
+    # Collect replay frame before VLM (matches original top-of-loop behavior)
+    for ep in episodes:
+        frame = _collect_replay_frame(ep.obs)
+        if frame is not None:
+            ep.replay_images.append(frame)
+
+    # Build batched images
+    all_images = [get_libero_images(ep.env, ep.obs) for ep in episodes]
+
+    img_tensors = {}
+    img_masks = {}
+    for model_key in ["base_0_rgb", "left_wrist_0_rgb"]:
+        tensors = []
+        masks = []
+        for images in all_images:
+            if model_key in images:
+                t = torch.from_numpy(images[model_key]).float() / 127.5 - 1.0
+                tensors.append(t)
+                masks.append(True)
+            else:
+                tensors.append(torch.zeros(224, 224, 3))
+                masks.append(False)
+        img_tensors[model_key] = torch.stack(tensors).to(device)
+        img_masks[model_key] = torch.tensor(masks, dtype=torch.bool, device=device)
+
+    # Build per-episode prompt tokens (different proprio → different tokens)
+    prompt_tokens_list = []
+    for ep in episodes:
+        proprio_raw = get_proprio_from_obs(ep.obs)
+        proprio_norm = norm_helper.normalize_proprio(proprio_raw)
+        state_padded = pad_to_dim(proprio_norm, model_proprio_dim)
+        ep.state_padded = state_padded
+
+        proprio_dim = wp_tokenizer.proprio_dim
+        state_for_prompt = state_padded[:proprio_dim]
+        prompt_text = f"Task: {ep.task_desc.strip().replace('_', ' ').lower()}, State: "
+        discretized = np.digitize(np.clip(state_for_prompt, -1, 1), np.linspace(-1, 1, 257)[:-1]) - 1
+        prompt_text += " ".join(map(str, discretized.astype(int))) + ";\n"
+
+        tokens = wp_tokenizer._pg_tokenizer.encode(prompt_text, add_bos=True)
+        prompt_tokens_list.append(tokens)
+
+    # Pad tokens to max length
+    max_tok_len = max(len(t) for t in prompt_tokens_list)
+    padded_tokens = []
+    padded_masks = []
+    for tokens in prompt_tokens_list:
+        pad_len = max_tok_len - len(tokens)
+        padded_tokens.append(tokens + [0] * pad_len)
+        padded_masks.append([True] * len(tokens) + [False] * pad_len)
+
+    prompt_tokens = torch.tensor(padded_tokens, dtype=torch.long, device=device)
+    prompt_mask = torch.tensor(padded_masks, dtype=torch.bool, device=device)
+
+    t_vlm = time.time()
+    waypoints_batch = vlm.generate_waypoints(
+        images=img_tensors,
+        image_masks=img_masks,
+        prompt_tokens=prompt_tokens,
+        prompt_mask=prompt_mask,
+        wp_tokenizer=wp_tokenizer,
+    )
+    vlm_ms = (time.time() - t_vlm) * 1000
+
+    # Distribute results
+    for ep, waypoints in zip(episodes, waypoints_batch):
+        ep.replan_count += 1
+        ep.waypoints = waypoints
+        ep.wp_idx = 0
+        ep.start_wp = ep.state_padded.copy()
+        ep.steps_this_cycle = 0
+
+        if not waypoints:
+            logger.info(
+                f"  [ep{ep.trial_idx} replan {ep.replan_count}] VLM empty ({vlm_ms:.0f}ms), stopping"
+            )
+            ep.state = EpState.DONE
+            continue
+
+        valid_wps = [(p, d) for p, d in waypoints if d > 0]
+        durations = [d for _, d in valid_wps]
+        logger.info(
+            f"  [ep{ep.trial_idx} replan {ep.replan_count}] VLM: {len(waypoints)} wps, "
+            f"{len(valid_wps)} valid, durations={durations}, vlm_time={vlm_ms / B:.0f}ms"
+        )
+        for wi, (pv, dur) in enumerate(waypoints):
+            logger.info(f"    [ep{ep.trial_idx}] wp[{wi}]: proprio={_fmt_array(pv, 6)}, duration={dur}")
+
+        if not _advance_to_valid_wp(ep):
+            # No valid waypoints — do no-op
+            logger.warning(f"  [ep{ep.trial_idx} replan {ep.replan_count}] no valid wps, advancing with no-op")
+            ep.obs, ep.reward, ep.done, _ = ep.env.step(np.zeros(actual_action_dim))
+            ep.t += 1
+            if ep.done:
+                ep.success = ep.reward > 0
+                ep.state = EpState.DONE
+            elif ep.t >= max_steps_total:
+                ep.state = EpState.DONE
+            else:
+                ep.state = EpState.NEED_VLM
+        else:
+            ep.state = EpState.NEED_AE
+
+
+@torch.no_grad()
+def _batch_ae_inference(ae_model, episodes, cfg, device, pg_tok):
+    """Batch AE action prediction for multiple episodes."""
+    model_proprio_dim = cfg.get("model_proprio_dim", 32)
+    max_dur = cfg.get("horizon_steps", 32)
+    B = len(episodes)
+
+    # Prepare per-episode data
+    all_images = []
+    start_wps = []
+    end_wps = []
+    durations = []
+
+    for ep in episodes:
+        wp_proprio, wp_duration = ep.waypoints[ep.wp_idx]
+        duration = wp_duration
+        if duration > max_dur:
+            logger.warning(
+                f"    [ep{ep.trial_idx}] wp[{ep.wp_idx}]: duration {duration} exceeds max {max_dur}, clamping"
+            )
+            duration = max_dur
+
+        end_wp = pad_to_dim(wp_proprio, model_proprio_dim)
+        ep.current_end_wp = end_wp
+        ep.current_duration = duration
+
+        fresh_images = get_libero_images(ep.env, ep.obs)
+        all_images.append(fresh_images)
+        start_wps.append(ep.start_wp)
+        end_wps.append(end_wp)
+        durations.append(float(duration))
+
+    # Build batched image tensors (CHW for AE)
+    img_tensors = {}
+    img_masks = {}
+    for model_key in ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"]:
+        tensors = []
+        masks = []
+        for images in all_images:
+            if model_key in images:
+                t = torch.from_numpy(images[model_key]).float() / 127.5 - 1.0
+                t = t.permute(2, 0, 1)  # HWC -> CHW
+                tensors.append(t)
+                masks.append(True)
+            else:
+                tensors.append(torch.zeros(3, 224, 224))
+                masks.append(False)
+        img_tensors[model_key] = torch.stack(tensors).to(device)
+        img_masks[model_key] = torch.tensor(masks, dtype=torch.bool, device=device)
+
+    # Build prompt tokens (same instruction for all episodes in same task)
+    task_desc = episodes[0].task_desc
+    text = f"Task: {task_desc.strip().replace('_', ' ').lower()}, \n"
+    tids = pg_tok.encode(text, add_bos=True)
+    ae_max_len = 64
+    tids_len = len(tids)
+    if tids_len < ae_max_len:
+        tids_padded = tids + [0] * (ae_max_len - tids_len)
+        tok_mask = [True] * tids_len + [False] * (ae_max_len - tids_len)
+    else:
+        tids_padded = tids[:ae_max_len]
+        tok_mask = [True] * ae_max_len
+
+    prompt_tokens = torch.tensor([tids_padded] * B, dtype=torch.long, device=device)
+    prompt_mask = torch.tensor([tok_mask] * B, dtype=torch.bool, device=device)
+
+    class _Obs:
+        def __init__(self):
+            self.images = img_tensors
+            self.image_masks = img_masks
+            self.state = torch.zeros(B, 32, device=device)
+            self.tokenized_prompt = prompt_tokens
+            self.tokenized_prompt_mask = prompt_mask
+            self.token_ar_mask = None
+            self.token_loss_mask = None
+
+    obs = _Obs()
+
+    start_t = torch.from_numpy(np.stack(start_wps)).float().to(device)
+    end_t = torch.from_numpy(np.stack(end_wps)).float().to(device)
+    dur_t = torch.tensor(durations, dtype=torch.float32, device=device)
+
+    t_ae = time.time()
+    actions_batch = ae_model.sample_actions(obs, start_t, end_t, dur_t)
+    ae_ms = (time.time() - t_ae) * 1000
+
+    actions_np = actions_batch.cpu().numpy()
+
+    for i, ep in enumerate(episodes):
+        ep.action_buffer = actions_np[i]
+        ep.action_idx = 0
+        ep.num_execute = min(int(ep.current_duration), ep.action_buffer.shape[0])
+        ep.state = EpState.EXECUTING
+
+        logger.info(
+            f"    [ep{ep.trial_idx}] ae[{ep.wp_idx}]: shape={ep.action_buffer.shape}, "
+            f"execute={ep.num_execute}, "
+            f"range=[{ep.action_buffer.min():.3f}, {ep.action_buffer.max():.3f}], "
+            f"ae_time={ae_ms / B:.0f}ms"
+        )
+
+
+def _drain_episode_actions(ep, norm_helper, actual_action_dim, max_steps_total):
+    """Execute all remaining actions in ep's action buffer, then transition."""
+    while ep.action_idx < ep.num_execute:
+        action_raw = norm_helper.unnormalize_actions(
+            ep.action_buffer[ep.action_idx, :actual_action_dim]
+        )
+
+        # Gripper processing (matches original run_episode)
+        gripper = action_raw[-1]
+        gripper = gripper * 2.0 - 1.0
+        gripper = np.sign(gripper)
+        gripper = -gripper
+        action_raw[-1] = gripper
+
+        ep.obs, ep.reward, ep.done, _ = ep.env.step(action_raw)
+        ep.t += 1
+        ep.action_idx += 1
+        ep.steps_this_cycle += 1
+
+        # Collect replay frame
+        frame = _collect_replay_frame(ep.obs)
+        if frame is not None:
+            ep.replay_images.append(frame)
+
+        if ep.done:
+            ep.success = ep.reward > 0
+            ep.state = EpState.DONE
+            return
+
+        if ep.t >= max_steps_total:
+            ep.state = EpState.DONE
+            return
+
+    # Action buffer exhausted — advance to next waypoint
+    ep.start_wp = ep.current_end_wp.copy()
+    ep.wp_idx += 1
+
+    if _advance_to_valid_wp(ep):
+        ep.state = EpState.NEED_AE
+    else:
+        # No more valid waypoints in this replan cycle
+        if ep.steps_this_cycle == 0:
+            # No actions were executed at all — do no-op to prevent stuck
+            logger.warning(f"  [ep{ep.trial_idx} replan {ep.replan_count}] no actions executed, advancing with no-op")
+            ep.obs, ep.reward, ep.done, _ = ep.env.step(np.zeros(actual_action_dim))
+            ep.t += 1
+            if ep.done:
+                ep.success = ep.reward > 0
+                ep.state = EpState.DONE
+                return
+
+        if ep.t >= max_steps_total:
+            ep.state = EpState.DONE
+        else:
+            ep.state = EpState.NEED_VLM
+
+
+def run_batch_episodes(
+    vlm, ae_model, wp_tokenizer, norm_helper,
+    envs, initial_states, task_desc, cfg, device, pg_tok,
+):
+    """Run multiple episodes in batch with dynamic scheduling.
+
+    Returns:
+        List of (success, replay_images) tuples, one per episode.
+    """
+    rc = get_robot_config("libero")
+    actual_action_dim = rc.actual_action_dim
+    max_steps = MAX_STEPS_MAP.get(cfg.get("task_suite", "libero_object"), 280)
+    num_steps_wait = cfg.get("num_steps_wait", 10)
+    max_steps_total = max_steps + num_steps_wait
+
+    # Initialize episodes
+    episodes = []
+    for i, (env, init_state) in enumerate(zip(envs, initial_states)):
+        ep = BatchEpisode(env, i, task_desc)
+        env.reset()
+        ep.obs = env.set_init_state(init_state)
+        episodes.append(ep)
+
+    # Wait steps (per episode, sequential — CPU only)
+    dummy_action = np.zeros(7)
+    for ep in episodes:
+        while ep.t < num_steps_wait:
+            ep.obs, _, ep.done, _ = ep.env.step(dummy_action)
+            ep.t += 1
+            if ep.done:
+                ep.state = EpState.DONE
+                ep.success = True
+                break
+
+    # Main scheduling loop
+    while any(ep.state != EpState.DONE for ep in episodes):
+        # Phase 1: Batch VLM for all episodes needing replan
+        vlm_eps = [ep for ep in episodes if ep.state == EpState.NEED_VLM]
+        if vlm_eps:
+            _batch_vlm_inference(vlm, vlm_eps, wp_tokenizer, norm_helper, cfg, device, max_steps_total)
+
+        # Phase 2: Batch AE for all episodes needing action prediction
+        ae_eps = [ep for ep in episodes if ep.state == EpState.NEED_AE]
+        if ae_eps:
+            _batch_ae_inference(ae_model, ae_eps, cfg, device, pg_tok)
+
+        # Phase 3: Drain all EXECUTING episodes (CPU env.step only)
+        executing_eps = [ep for ep in episodes if ep.state == EpState.EXECUTING]
+        for ep in executing_eps:
+            _drain_episode_actions(ep, norm_helper, actual_action_dim, max_steps_total)
+
+        # Safety: break if no episode was actionable (should not happen)
+        if not vlm_eps and not ae_eps and not executing_eps:
+            logger.warning("Batch loop: no actionable episodes, breaking")
+            break
+
+    for ep in episodes:
+        logger.info(
+            f"  ep{ep.trial_idx} done: steps={ep.t}, replans={ep.replan_count}, success={ep.success}"
+        )
+
+    return [(ep.success, ep.replay_images) for ep in episodes]
+
+
+# ---------------------------------------------------------------------------
 # Main evaluation
 # ---------------------------------------------------------------------------
 
@@ -648,12 +1066,14 @@ def evaluate(cfg):
     results = {}
     total_success = 0
     total_episodes = 0
+    batch_size = cfg.get("batch_size", 1)
 
     for task_idx in range(num_tasks):
         task = bm.get_task(task_idx)
         task_name = task.name
         task_desc = task.language
         initial_states = bm.get_task_init_states(task_idx)
+        actual_num_trials = min(num_trials, len(initial_states))
 
         env_args = {
             "bddl_file_name": bm.get_task_bddl_file_path(task_idx),
@@ -662,52 +1082,111 @@ def evaluate(cfg):
         }
 
         from libero.libero.envs import OffScreenRenderEnv
-        t0 = time.time()
-        env = OffScreenRenderEnv(**env_args)
-        env.seed(0)
-        logger.info(f"Env init for task {task_idx}: {time.time() - t0:.1f}s")
-
         successes = 0
-        for trial in range(min(num_trials, len(initial_states))):
-            t_ep = time.time()
-            logger.info(f"Task {task_idx}/{num_tasks}: {task_name} trial {trial}")
-            success, replay_images = run_episode(
-                vlm, ae_model, wp_tokenizer, norm_helper,
-                env, initial_states[trial], task_desc, cfg, device, pg_tok,
-            )
-            ep_secs = time.time() - t_ep
-            if success:
-                successes += 1
-                total_success += 1
-            total_episodes += 1
 
-            suffix = "success" if success else "failure"
-            task_segment = task_desc.replace(" ", "_")
-            if replay_images:
-                video_file = video_out_path / f"rollout_{task_segment}_t{trial}_{suffix}.mp4"
-                imageio.mimwrite(
-                    str(video_file),
-                    [np.asarray(x) for x in replay_images],
-                    fps=10,
+        if batch_size > 1:
+            # --- Batch mode ---
+            t0 = time.time()
+            n_envs = min(batch_size, actual_num_trials)
+            envs = [OffScreenRenderEnv(**env_args) for _ in range(n_envs)]
+            for e in envs:
+                e.seed(0)
+            logger.info(f"Env init for task {task_idx} ({n_envs} envs): {time.time() - t0:.1f}s")
+
+            for batch_start in range(0, actual_num_trials, batch_size):
+                batch_end = min(batch_start + batch_size, actual_num_trials)
+                cur_batch_size = batch_end - batch_start
+                batch_envs = envs[:cur_batch_size]
+                batch_init_states = [initial_states[t] for t in range(batch_start, batch_end)]
+
+                t_batch = time.time()
+                trial_ids = list(range(batch_start, batch_end))
+                logger.info(f"Task {task_idx}/{num_tasks}: {task_name} trials {trial_ids}")
+
+                batch_results = run_batch_episodes(
+                    vlm, ae_model, wp_tokenizer, norm_helper,
+                    batch_envs, batch_init_states, task_desc, cfg, device, pg_tok,
                 )
-                logger.info(f"  -> {suffix.upper()} ({ep_secs:.1f}s, video: {video_file})")
-            else:
-                logger.info(f"  -> {suffix.upper()} ({ep_secs:.1f}s)")
+                batch_secs = time.time() - t_batch
 
-            trials_done = trial + 1
-            task_sr = successes / trials_done
-            overall_sr = total_success / max(total_episodes, 1)
-            logger.info(
-                f"  [成功率] 当前任务: {successes}/{trials_done} = {task_sr:.2%} | "
-                f"整体: {total_success}/{total_episodes} = {overall_sr:.2%}"
-            )
+                for offset, (success, replay_images) in enumerate(batch_results):
+                    trial = batch_start + offset
+                    if success:
+                        successes += 1
+                        total_success += 1
+                    total_episodes += 1
+
+                    suffix = "success" if success else "failure"
+                    task_segment = task_desc.replace(" ", "_")
+                    if replay_images:
+                        video_file = video_out_path / f"rollout_{task_segment}_t{trial}_{suffix}.mp4"
+                        imageio.mimwrite(
+                            str(video_file),
+                            [np.asarray(x) for x in replay_images],
+                            fps=10,
+                        )
+                        logger.info(f"  trial {trial} -> {suffix.upper()} (video: {video_file})")
+                    else:
+                        logger.info(f"  trial {trial} -> {suffix.upper()}")
+
+                logger.info(f"  batch [{batch_start}:{batch_end}] done ({batch_secs:.1f}s)")
+
+                overall_sr = total_success / max(total_episodes, 1)
+                logger.info(
+                    f"  [成功率] 当前任务: {successes}/{batch_end} = {successes / batch_end:.2%} | "
+                    f"整体: {total_success}/{total_episodes} = {overall_sr:.2%}"
+                )
+
+            for e in envs:
+                e.close()
+        else:
+            # --- Serial mode (original, unchanged) ---
+            t0 = time.time()
+            env = OffScreenRenderEnv(**env_args)
+            env.seed(0)
+            logger.info(f"Env init for task {task_idx}: {time.time() - t0:.1f}s")
+
+            for trial in range(actual_num_trials):
+                t_ep = time.time()
+                logger.info(f"Task {task_idx}/{num_tasks}: {task_name} trial {trial}")
+                success, replay_images = run_episode(
+                    vlm, ae_model, wp_tokenizer, norm_helper,
+                    env, initial_states[trial], task_desc, cfg, device, pg_tok,
+                )
+                ep_secs = time.time() - t_ep
+                if success:
+                    successes += 1
+                    total_success += 1
+                total_episodes += 1
+
+                suffix = "success" if success else "failure"
+                task_segment = task_desc.replace(" ", "_")
+                if replay_images:
+                    video_file = video_out_path / f"rollout_{task_segment}_t{trial}_{suffix}.mp4"
+                    imageio.mimwrite(
+                        str(video_file),
+                        [np.asarray(x) for x in replay_images],
+                        fps=10,
+                    )
+                    logger.info(f"  -> {suffix.upper()} ({ep_secs:.1f}s, video: {video_file})")
+                else:
+                    logger.info(f"  -> {suffix.upper()} ({ep_secs:.1f}s)")
+
+                trials_done = trial + 1
+                task_sr = successes / trials_done
+                overall_sr = total_success / max(total_episodes, 1)
+                logger.info(
+                    f"  [成功率] 当前任务: {successes}/{trials_done} = {task_sr:.2%} | "
+                    f"整体: {total_success}/{total_episodes} = {overall_sr:.2%}"
+                )
+
+            env.close()
 
         results[task_name] = {
-            "success_rate": successes / min(num_trials, len(initial_states)),
+            "success_rate": successes / actual_num_trials,
             "successes": successes,
-            "trials": min(num_trials, len(initial_states)),
+            "trials": actual_num_trials,
         }
-        env.close()
 
     overall_rate = total_success / max(total_episodes, 1)
     logger.info(f"\n{'='*60}")
