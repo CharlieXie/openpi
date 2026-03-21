@@ -18,9 +18,9 @@ import contextlib
 import enum
 import json
 import logging
+import multiprocessing as mp
 import pathlib
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import imageio
@@ -948,6 +948,191 @@ def _drain_episode_actions(ep, norm_helper, actual_action_dim, max_steps_total):
             ep.state = EpState.NEED_VLM
 
 
+# ---------------------------------------------------------------------------
+# Subprocess-based parallel env.step
+# ---------------------------------------------------------------------------
+# Each env runs in its own process with its own OSMesa GL context, so
+# env.step() calls are truly parallel without rendering corruption.
+
+def _env_worker_fn(conn, env_args):
+    """Subprocess entry point: owns one LIBERO env, serves commands via pipe."""
+    import numpy as _np
+    from libero.libero.envs import OffScreenRenderEnv
+
+    env = OffScreenRenderEnv(**env_args)
+    env.seed(0)
+    conn.send("ready")
+
+    while True:
+        try:
+            cmd = conn.recv()
+        except EOFError:
+            break
+
+        if cmd[0] == "reset":
+            env.reset()
+            obs = env.set_init_state(cmd[1])
+            conn.send(obs)
+
+        elif cmd[0] == "step":
+            obs, reward, done, info = env.step(cmd[1])
+            conn.send((obs, reward, done, info))
+
+        elif cmd[0] == "drain":
+            actions = cmd[1]
+            replay_frames = []
+            obs, reward, done = None, 0.0, False
+            steps = 0
+            for action in actions:
+                obs, reward, done, _ = env.step(action)
+                steps += 1
+                frame = _collect_replay_frame(obs)
+                if frame is not None:
+                    replay_frames.append(frame)
+                if done:
+                    break
+            conn.send((obs, reward, done, steps, replay_frames))
+
+        elif cmd[0] == "wait":
+            num_steps = cmd[1]
+            dummy = _np.zeros(7)
+            obs, done = None, False
+            steps = 0
+            for _ in range(num_steps):
+                obs, _, done, _ = env.step(dummy)
+                steps += 1
+                if done:
+                    break
+            conn.send((obs, done, steps))
+
+        elif cmd[0] == "close":
+            env.close()
+            break
+
+    conn.close()
+
+
+class SubprocEnv:
+    """LIBERO env running in a subprocess for parallel env.step()."""
+
+    def __init__(self, env_args):
+        self.parent_conn, child_conn = mp.Pipe()
+        self.proc = mp.Process(
+            target=_env_worker_fn, args=(child_conn, env_args), daemon=True,
+        )
+        self.proc.start()
+        child_conn.close()
+        self._ready = False
+
+    def wait_ready(self):
+        if not self._ready:
+            assert self.parent_conn.recv() == "ready"
+            self._ready = True
+
+    # --- synchronous helpers (used for rare one-off calls) ---
+
+    def reset_and_init(self, init_state):
+        self.parent_conn.send(("reset", init_state))
+        return self.parent_conn.recv()
+
+    def step(self, action):
+        """Drop-in replacement for env.step(); returns (obs, reward, done, info)."""
+        self.parent_conn.send(("step", action))
+        return self.parent_conn.recv()
+
+    # --- non-blocking send / blocking recv (for parallel patterns) ---
+
+    def send_reset(self, init_state):
+        self.parent_conn.send(("reset", init_state))
+
+    def recv_reset(self):
+        return self.parent_conn.recv()
+
+    def send_drain(self, actions):
+        self.parent_conn.send(("drain", actions))
+
+    def recv_drain(self):
+        """Returns (obs, reward, done, steps, replay_frames)."""
+        return self.parent_conn.recv()
+
+    def send_wait(self, num_steps):
+        self.parent_conn.send(("wait", num_steps))
+
+    def recv_wait(self):
+        """Returns (obs, done, steps)."""
+        return self.parent_conn.recv()
+
+    def close(self):
+        try:
+            self.parent_conn.send(("close",))
+        except (BrokenPipeError, OSError):
+            pass
+        self.proc.join(timeout=10)
+        if self.proc.is_alive():
+            self.proc.terminate()
+        self.parent_conn.close()
+
+
+def _prepare_drain_actions(ep, norm_helper, actual_action_dim):
+    """Pre-process all remaining actions in ep's buffer (unnorm + gripper)."""
+    actions = []
+    for i in range(ep.action_idx, ep.num_execute):
+        action_raw = norm_helper.unnormalize_actions(
+            ep.action_buffer[i, :actual_action_dim]
+        )
+        gripper = action_raw[-1]
+        gripper = gripper * 2.0 - 1.0
+        gripper = np.sign(gripper)
+        gripper = -gripper
+        action_raw[-1] = gripper
+        actions.append(action_raw)
+    return actions
+
+
+def _apply_drain_result(ep, obs, reward, done, steps, replay_frames,
+                        actual_action_dim, max_steps_total):
+    """Update episode state after a subprocess drain completes."""
+    ep.obs = obs
+    ep.reward = reward
+    ep.done = done
+    ep.t += steps
+    ep.action_idx += steps
+    ep.steps_this_cycle += steps
+    ep.replay_images.extend(replay_frames)
+
+    if done:
+        ep.success = reward > 0
+        ep.state = EpState.DONE
+        return
+
+    if ep.t >= max_steps_total:
+        ep.state = EpState.DONE
+        return
+
+    # Action buffer exhausted — advance to next waypoint
+    ep.start_wp = ep.current_end_wp.copy()
+    ep.wp_idx += 1
+
+    if _advance_to_valid_wp(ep):
+        ep.state = EpState.NEED_AE
+    else:
+        if ep.steps_this_cycle == 0:
+            logger.warning(
+                f"  [ep{ep.trial_idx} replan {ep.replan_count}] no actions executed, advancing with no-op"
+            )
+            ep.obs, ep.reward, ep.done, _ = ep.env.step(np.zeros(actual_action_dim))
+            ep.t += 1
+            if ep.done:
+                ep.success = ep.reward > 0
+                ep.state = EpState.DONE
+                return
+
+        if ep.t >= max_steps_total:
+            ep.state = EpState.DONE
+        else:
+            ep.state = EpState.NEED_VLM
+
+
 def run_batch_episodes(
     vlm, ae_model, wp_tokenizer, norm_helper,
     envs, initial_states, task_desc, cfg, device, pg_tok,
@@ -963,57 +1148,80 @@ def run_batch_episodes(
     num_steps_wait = cfg.get("num_steps_wait", 10)
     max_steps_total = max_steps + num_steps_wait
 
-    # Initialize episodes
-    episodes = []
-    for i, (env, init_state) in enumerate(zip(envs, initial_states)):
-        ep = BatchEpisode(env, i, task_desc)
-        env.reset()
-        ep.obs = env.set_init_state(init_state)
-        episodes.append(ep)
+    use_subproc = len(envs) > 0 and isinstance(envs[0], SubprocEnv)
 
-    # Wait steps (per episode, parallel threads — CPU only)
-    def _wait_episode(ep, n_wait):
-        dummy = np.zeros(7)
-        while ep.t < n_wait:
-            ep.obs, _, ep.done, _ = ep.env.step(dummy)
-            ep.t += 1
-            if ep.done:
+    # Initialize episodes (parallel reset when using subprocesses)
+    episodes = []
+    if use_subproc:
+        for i, (env, init_state) in enumerate(zip(envs, initial_states)):
+            ep = BatchEpisode(env, i, task_desc)
+            env.send_reset(init_state)
+            episodes.append(ep)
+        for ep in episodes:
+            ep.obs = ep.env.recv_reset()
+    else:
+        for i, (env, init_state) in enumerate(zip(envs, initial_states)):
+            ep = BatchEpisode(env, i, task_desc)
+            env.reset()
+            ep.obs = env.set_init_state(init_state)
+            episodes.append(ep)
+
+    # Wait steps
+    if use_subproc:
+        for ep in episodes:
+            ep.env.send_wait(num_steps_wait)
+        for ep in episodes:
+            obs, done, steps = ep.env.recv_wait()
+            ep.obs = obs
+            ep.t = steps
+            if done:
                 ep.state = EpState.DONE
                 ep.success = True
-                break
-
-    with ThreadPoolExecutor(max_workers=len(episodes)) as wait_pool:
-        list(wait_pool.map(lambda ep: _wait_episode(ep, num_steps_wait), episodes))
+    else:
+        dummy_action = np.zeros(7)
+        for ep in episodes:
+            while ep.t < num_steps_wait:
+                ep.obs, _, ep.done, _ = ep.env.step(dummy_action)
+                ep.t += 1
+                if ep.done:
+                    ep.state = EpState.DONE
+                    ep.success = True
+                    break
 
     # Main scheduling loop
-    with ThreadPoolExecutor(max_workers=len(episodes)) as executor:
-        while any(ep.state != EpState.DONE for ep in episodes):
-            # Phase 1: Batch VLM for all episodes needing replan
-            vlm_eps = [ep for ep in episodes if ep.state == EpState.NEED_VLM]
-            if vlm_eps:
-                _batch_vlm_inference(vlm, vlm_eps, wp_tokenizer, norm_helper, cfg, device, max_steps_total)
+    while any(ep.state != EpState.DONE for ep in episodes):
+        # Phase 1: Batch VLM for all episodes needing replan
+        vlm_eps = [ep for ep in episodes if ep.state == EpState.NEED_VLM]
+        if vlm_eps:
+            _batch_vlm_inference(vlm, vlm_eps, wp_tokenizer, norm_helper, cfg, device, max_steps_total)
 
-            # Phase 2: Batch AE for all episodes needing action prediction
-            ae_eps = [ep for ep in episodes if ep.state == EpState.NEED_AE]
-            if ae_eps:
-                _batch_ae_inference(ae_model, ae_eps, cfg, device, pg_tok)
+        # Phase 2: Batch AE for all episodes needing action prediction
+        ae_eps = [ep for ep in episodes if ep.state == EpState.NEED_AE]
+        if ae_eps:
+            _batch_ae_inference(ae_model, ae_eps, cfg, device, pg_tok)
 
-            # Phase 3: Drain all EXECUTING episodes in parallel threads
-            executing_eps = [ep for ep in episodes if ep.state == EpState.EXECUTING]
-            if executing_eps:
-                futures = {
-                    executor.submit(
-                        _drain_episode_actions, ep, norm_helper, actual_action_dim, max_steps_total
-                    ): ep
-                    for ep in executing_eps
-                }
-                for future in futures:
-                    future.result()  # wait for all to complete
+        # Phase 3: Drain all EXECUTING episodes
+        executing_eps = [ep for ep in episodes if ep.state == EpState.EXECUTING]
+        if executing_eps:
+            if use_subproc:
+                # Parallel drain: send all, then recv all
+                for ep in executing_eps:
+                    actions = _prepare_drain_actions(ep, norm_helper, actual_action_dim)
+                    ep.env.send_drain(actions)
+                for ep in executing_eps:
+                    obs, reward, done, steps, replay_frames = ep.env.recv_drain()
+                    _apply_drain_result(
+                        ep, obs, reward, done, steps, replay_frames,
+                        actual_action_dim, max_steps_total,
+                    )
+            else:
+                for ep in executing_eps:
+                    _drain_episode_actions(ep, norm_helper, actual_action_dim, max_steps_total)
 
-            # Safety: break if no episode was actionable (should not happen)
-            if not vlm_eps and not ae_eps and not executing_eps:
-                logger.warning("Batch loop: no actionable episodes, breaking")
-                break
+        # Safety: break if no episode was actionable (should not happen)
+        if not vlm_eps and not ae_eps and not executing_eps:
+            logger.warning("Batch loop: no actionable episodes, breaking")
+            break
 
     for ep in episodes:
         logger.info(
@@ -1097,13 +1305,13 @@ def evaluate(cfg):
         successes = 0
 
         if batch_size > 1:
-            # --- Batch mode ---
+            # --- Batch mode (subprocess envs for parallel env.step) ---
             t0 = time.time()
             n_envs = min(batch_size, actual_num_trials)
-            envs = [OffScreenRenderEnv(**env_args) for _ in range(n_envs)]
+            envs = [SubprocEnv(env_args) for _ in range(n_envs)]
             for e in envs:
-                e.seed(0)
-            logger.info(f"Env init for task {task_idx} ({n_envs} envs): {time.time() - t0:.1f}s")
+                e.wait_ready()
+            logger.info(f"Env init for task {task_idx} ({n_envs} subproc envs): {time.time() - t0:.1f}s")
 
             for batch_start in range(0, actual_num_trials, batch_size):
                 batch_end = min(batch_start + batch_size, actual_num_trials)
