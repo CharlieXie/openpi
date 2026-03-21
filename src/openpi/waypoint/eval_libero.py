@@ -21,6 +21,10 @@ import pathlib
 import time
 from pathlib import Path
 
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue, Empty
+
 import imageio
 import numpy as np
 import safetensors.torch
@@ -719,16 +723,669 @@ def evaluate(cfg):
     return results
 
 
+# ---------------------------------------------------------------------------
+# Parallel evaluation infrastructure
+# ---------------------------------------------------------------------------
+
+def _record_frame(obs, replay_images):
+    """Extract agentview + wrist camera frame and append to replay buffer."""
+    agentview = obs.get("agentview_image", obs.get("agentview_rgb"))
+    if agentview is None:
+        return
+    head_frame = np.ascontiguousarray(agentview[::-1, ::-1])
+    wrist_raw = obs.get("robot0_eye_in_hand_image", obs.get("robot0_eye_in_hand_rgb"))
+    if wrist_raw is not None:
+        wrist_frame = np.ascontiguousarray(wrist_raw[::-1, ::-1])
+        if wrist_frame.shape[0] != head_frame.shape[0]:
+            from PIL import Image as PILImage
+            wrist_frame = np.array(
+                PILImage.fromarray(wrist_frame).resize(
+                    (wrist_frame.shape[1], head_frame.shape[0]), PILImage.BILINEAR
+                )
+            )
+        replay_images.append(np.concatenate([head_frame, wrist_frame], axis=1))
+    else:
+        replay_images.append(head_frame)
+
+
+class _InferenceRequest:
+    """Pending GPU inference request submitted by an episode thread."""
+    __slots__ = ("type", "data", "result", "event")
+
+    def __init__(self, req_type: str, data: dict):
+        self.type = req_type
+        self.data = data
+        self.result = None
+        self.event = threading.Event()
+
+
+class InferenceServer:
+    """Dedicated GPU thread that collects, batches, and serves inference requests.
+
+    Episode threads submit VLM/AE requests via ``submit_vlm`` / ``submit_ae``
+    (which block until the result is ready). The server thread collects requests
+    from a shared queue, waits briefly for more same-type requests to arrive
+    (opportunistic batching), then runs batched inference and unblocks callers.
+
+    This ensures:
+      - Only one thread ever touches CUDA (no contention).
+      - Multiple episode threads can run env.step() in parallel while the
+        server is idle or processing another episode's request.
+    """
+
+    def __init__(
+        self,
+        vlm,
+        ae_model,
+        wp_tokenizer,
+        device,
+        pg_tok,
+        max_batch: int = 8,
+        max_wait_ms: float = 8,
+    ):
+        self.vlm = vlm
+        self.ae_model = ae_model
+        self.wp_tokenizer = wp_tokenizer
+        self.device = device
+        self.pg_tok = pg_tok
+        self.max_batch = max_batch
+        self.max_wait = max_wait_ms / 1000.0
+        self._queue: Queue = Queue()
+        self._running = False
+        self._thread: threading.Thread | None = None
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._serve_loop, daemon=True, name="inference-server",
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=10)
+
+    # -- public API (called from episode threads, blocks until done) --------
+
+    def submit_vlm(self, images: dict, instruction: str, state_padded: np.ndarray):
+        req = _InferenceRequest("vlm", {
+            "images": images,
+            "instruction": instruction,
+            "state_padded": state_padded,
+        })
+        self._queue.put(req)
+        req.event.wait()
+        return req.result
+
+    def submit_ae(
+        self, images: dict, instruction: str,
+        start_wp: np.ndarray, end_wp: np.ndarray, duration: float,
+    ):
+        req = _InferenceRequest("ae", {
+            "images": images,
+            "instruction": instruction,
+            "start_wp": start_wp,
+            "end_wp": end_wp,
+            "duration": duration,
+        })
+        self._queue.put(req)
+        req.event.wait()
+        return req.result
+
+    # -- server loop (single dedicated GPU thread) -------------------------
+
+    def _serve_loop(self):
+        while self._running:
+            try:
+                first = self._queue.get(timeout=0.5)
+            except Empty:
+                continue
+
+            batch = [first]
+            deadline = time.time() + self.max_wait
+            while len(batch) < self.max_batch:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                try:
+                    req = self._queue.get(timeout=max(0.001, remaining))
+                    if req.type == first.type:
+                        batch.append(req)
+                    else:
+                        self._queue.put(req)
+                        break
+                except Empty:
+                    break
+
+            try:
+                if first.type == "vlm":
+                    self._run_vlm_batch(batch)
+                else:
+                    self._run_ae_batch(batch)
+            except Exception as exc:
+                logger.error(
+                    "Inference server error (%s, batch=%d): %s",
+                    first.type, len(batch), exc, exc_info=True,
+                )
+                for req in batch:
+                    req.result = [] if req.type == "vlm" else None
+                    req.event.set()
+
+    # -- batched VLM -------------------------------------------------------
+
+    @torch.no_grad()
+    def _run_vlm_batch(self, requests: list):
+        B = len(requests)
+        device = self.device
+        wp_tok = self.wp_tokenizer
+
+        img_tensors: dict[str, torch.Tensor] = {}
+        img_masks: dict[str, torch.Tensor] = {}
+        for key in ["base_0_rgb", "left_wrist_0_rgb"]:
+            imgs, masks = [], []
+            for req in requests:
+                raw = req.data["images"]
+                if key in raw:
+                    t = torch.from_numpy(raw[key]).float() / 127.5 - 1.0
+                    imgs.append(t.unsqueeze(0))
+                    masks.append(torch.ones(1, dtype=torch.bool))
+                else:
+                    imgs.append(torch.zeros(1, 224, 224, 3))
+                    masks.append(torch.zeros(1, dtype=torch.bool))
+            img_tensors[key] = torch.cat(imgs, dim=0).to(device)
+            img_masks[key] = torch.cat(masks, dim=0).to(device)
+
+        token_lists = []
+        for req in requests:
+            d = req.data
+            proprio_dim = wp_tok.proprio_dim
+            state_for_prompt = d["state_padded"][:proprio_dim]
+            prompt = f"Task: {d['instruction'].strip().replace('_', ' ').lower()}, State: "
+            disc = np.digitize(
+                np.clip(state_for_prompt, -1, 1),
+                np.linspace(-1, 1, 257)[:-1],
+            ) - 1
+            prompt += " ".join(map(str, disc.astype(int))) + ";\n"
+            token_lists.append(wp_tok._pg_tokenizer.encode(prompt, add_bos=True))
+
+        max_len = max(len(tl) for tl in token_lists)
+        padded_ids, padded_mask = [], []
+        for tl in token_lists:
+            pad = max_len - len(tl)
+            padded_ids.append(tl + [0] * pad)
+            padded_mask.append([True] * len(tl) + [False] * pad)
+
+        prompt_tokens = torch.tensor(padded_ids, dtype=torch.long, device=device)
+        prompt_mask = torch.tensor(padded_mask, dtype=torch.bool, device=device)
+
+        t0 = time.time()
+        all_waypoints = self.vlm.generate_waypoints(
+            images=img_tensors,
+            image_masks=img_masks,
+            prompt_tokens=prompt_tokens,
+            prompt_mask=prompt_mask,
+            wp_tokenizer=wp_tok,
+        )
+        elapsed = (time.time() - t0) * 1000
+        logger.info(f"  [server] VLM batch={B}, time={elapsed:.0f}ms")
+
+        for i, req in enumerate(requests):
+            req.result = all_waypoints[i]
+            req.event.set()
+
+    # -- batched AE (direct model calls, bypasses preprocess_observation) ---
+
+    @torch.no_grad()
+    def _run_ae_batch(self, requests: list):
+        from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
+
+        B = len(requests)
+        device = self.device
+        model = self.ae_model
+
+        camera_order = ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"]
+        images_list: list[torch.Tensor] = []
+        img_masks_list: list[torch.Tensor] = []
+        for key in camera_order:
+            has_any = any(key in r.data["images"] for r in requests)
+            if not has_any:
+                continue
+            imgs, masks = [], []
+            for req in requests:
+                raw = req.data["images"]
+                if key in raw:
+                    t = torch.from_numpy(raw[key]).float() / 127.5 - 1.0
+                    t = t.permute(2, 0, 1)
+                    imgs.append(t.unsqueeze(0))
+                    masks.append(torch.ones(1, dtype=torch.bool))
+                else:
+                    imgs.append(torch.zeros(1, 3, 224, 224))
+                    masks.append(torch.zeros(1, dtype=torch.bool))
+            images_list.append(torch.cat(imgs, dim=0).to(device))
+            img_masks_list.append(torch.cat(masks, dim=0).to(device))
+
+        AE_MAX_TOK = 64
+        tids_batch, mask_batch = [], []
+        for req in requests:
+            text = f"Task: {req.data['instruction'].strip().replace('_', ' ').lower()}, \n"
+            tids = self.pg_tok.encode(text, add_bos=True)
+            n = len(tids)
+            if n < AE_MAX_TOK:
+                mask_batch.append([True] * n + [False] * (AE_MAX_TOK - n))
+                tids = tids + [0] * (AE_MAX_TOK - n)
+            else:
+                tids = tids[:AE_MAX_TOK]
+                mask_batch.append([True] * AE_MAX_TOK)
+            tids_batch.append(tids)
+
+        lang_tokens = torch.tensor(tids_batch, dtype=torch.long, device=device)
+        lang_masks = torch.tensor(mask_batch, dtype=torch.bool, device=device)
+
+        start_proprio = torch.stack(
+            [torch.from_numpy(r.data["start_wp"]).float() for r in requests],
+        ).to(device)
+        end_proprio = torch.stack(
+            [torch.from_numpy(r.data["end_wp"]).float() for r in requests],
+        ).to(device)
+        duration = torch.tensor(
+            [float(r.data["duration"]) for r in requests],
+            dtype=torch.float32, device=device,
+        )
+
+        # --- embed prefix (images + language) via model helper ---
+        prefix_embs, prefix_pad, prefix_att = model.embed_prefix(
+            images_list, img_masks_list, lang_tokens, lang_masks,
+        )
+        prefix_att_2d = make_att_2d_masks(prefix_pad, prefix_att)
+        prefix_pos = torch.cumsum(prefix_pad, dim=1) - 1
+        prefix_att_4d = prefix_att_2d[:, None, :, :]
+        prefix_att_4d = torch.where(prefix_att_4d, 0.0, -2.3819763e38)
+
+        model_dtype = (
+            model.paligemma_with_expert.paligemma
+            .language_model.layers[0].self_attn.q_proj.weight.dtype
+        )
+        if prefix_embs.dtype != model_dtype:
+            prefix_embs = prefix_embs.to(model_dtype)
+        if prefix_att_4d.dtype != model_dtype:
+            prefix_att_4d = prefix_att_4d.to(model_dtype)
+
+        _, past_kv = model.paligemma_with_expert.forward(
+            attention_mask=prefix_att_4d,
+            position_ids=prefix_pos,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+
+        # --- iterative denoising ---
+        num_steps = 10
+        noise = torch.randn(B, model.action_horizon, model.action_dim, device=device)
+        dt = -1.0 / num_steps
+        x_t = noise
+        t_val = torch.tensor(1.0, device=device)
+
+        t0 = time.time()
+        while t_val >= -dt / 2:
+            expanded_t = t_val.expand(B)
+            suffix_embs, suffix_pad, suffix_att, adarms_cond = model.embed_suffix(
+                start_proprio, end_proprio, x_t, expanded_t, duration,
+            )
+
+            suffix_len = suffix_pad.shape[1]
+            prefix_len = prefix_pad.shape[1]
+
+            prefix_2d = prefix_pad[:, None, :].expand(B, suffix_len, prefix_len)
+            suffix_att_2d = make_att_2d_masks(suffix_pad, suffix_att)
+            full_att = torch.cat([prefix_2d, suffix_att_2d], dim=2)
+            full_att_4d = full_att[:, None, :, :]
+            full_att_4d = torch.where(full_att_4d, 0.0, -2.3819763e38)
+            if full_att_4d.dtype != model_dtype:
+                full_att_4d = full_att_4d.to(model_dtype)
+
+            prefix_offsets = torch.sum(prefix_pad, dim=-1)[:, None]
+            position_ids = prefix_offsets + torch.cumsum(suffix_pad, dim=1) - 1
+
+            if suffix_embs.dtype != model_dtype:
+                suffix_embs = suffix_embs.to(model_dtype)
+
+            outputs, _ = model.paligemma_with_expert.forward(
+                attention_mask=full_att_4d,
+                position_ids=position_ids,
+                past_key_values=past_kv,
+                inputs_embeds=[None, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
+
+            suffix_out = outputs[1][:, -model.action_horizon:].float()
+            v_t = model.action_out_proj(suffix_out)
+            x_t = x_t + dt * v_t
+            t_val = t_val + dt
+
+        elapsed = (time.time() - t0) * 1000
+        if B > 1:
+            logger.debug(f"  [server] AE batch={B}, time={elapsed:.0f}ms")
+
+        for i, req in enumerate(requests):
+            req.result = x_t[i].cpu().numpy()
+            req.event.set()
+
+
+# ---------------------------------------------------------------------------
+# Episode runner for parallel mode
+# ---------------------------------------------------------------------------
+
+def run_episode_with_server(
+    server: InferenceServer,
+    wp_tokenizer,
+    norm_helper,
+    env,
+    initial_state,
+    task_desc: str,
+    cfg: dict,
+    pg_tok,
+    ep_label: str = "",
+):
+    """Run one LIBERO episode, delegating all GPU work to *server*.
+
+    Semantically identical to ``run_episode`` but uses ``server.submit_vlm``
+    and ``server.submit_ae`` instead of calling models directly.  This lets
+    multiple episode threads run env.step() in parallel while the server
+    thread batches and processes GPU requests.
+    """
+    env.reset()
+    obs = env.set_init_state(initial_state)
+
+    rc = get_robot_config("libero")
+    model_proprio_dim = cfg.get("model_proprio_dim", 32)
+    actual_action_dim = rc.actual_action_dim
+    max_steps = MAX_STEPS_MAP.get(cfg.get("task_suite", "libero_object"), 280)
+    num_steps_wait = cfg.get("num_steps_wait", 10)
+
+    t = 0
+    done = False
+    reward = 0.0
+    replay_images: list[np.ndarray] = []
+    replan_count = 0
+
+    dummy_action = np.zeros(7)
+    while t < num_steps_wait:
+        obs, _, done, _ = env.step(dummy_action)
+        t += 1
+        if done:
+            return True, replay_images
+
+    while t < max_steps + num_steps_wait and not done:
+        _record_frame(obs, replay_images)
+
+        images = get_libero_images(env, obs)
+        proprio_raw = get_proprio_from_obs(obs)
+        proprio_norm = norm_helper.normalize_proprio(proprio_raw)
+        state_padded = pad_to_dim(proprio_norm, model_proprio_dim)
+
+        t_vlm = time.time()
+        waypoints = server.submit_vlm(images, task_desc, state_padded)
+        vlm_ms = (time.time() - t_vlm) * 1000
+
+        replan_count += 1
+        if not waypoints:
+            logger.info(f"  {ep_label}[replan {replan_count}] VLM empty ({vlm_ms:.0f}ms)")
+            break
+
+        valid_wps = [(p, d) for p, d in waypoints if d > 0]
+        durations = [d for _, d in valid_wps]
+        logger.info(
+            f"  {ep_label}[replan {replan_count}] VLM: {len(waypoints)} wps, "
+            f"{len(valid_wps)} valid, durations={durations}, vlm={vlm_ms:.0f}ms"
+        )
+
+        start_wp = state_padded.copy()
+        steps_this_cycle = 0
+        max_dur = cfg.get("horizon_steps", 32)
+
+        for wp_idx, (proprio_values, duration) in enumerate(waypoints):
+            if duration <= 0 or done:
+                break
+            if duration > max_dur:
+                duration = max_dur
+
+            end_wp = pad_to_dim(proprio_values, model_proprio_dim)
+            fresh_images = get_libero_images(env, obs)
+
+            t_ae = time.time()
+            actions_norm = server.submit_ae(
+                fresh_images, task_desc, start_wp, end_wp, float(duration),
+            )
+            ae_ms = (time.time() - t_ae) * 1000
+
+            if actions_norm is None:
+                logger.warning(f"  {ep_label}ae[{wp_idx}]: server returned None")
+                break
+
+            num_execute = min(int(duration), actions_norm.shape[0])
+            logger.info(
+                f"  {ep_label}  ae[{wp_idx}]: exec={num_execute}, ae={ae_ms:.0f}ms"
+            )
+
+            for step_i in range(num_execute):
+                action_raw = norm_helper.unnormalize_actions(
+                    actions_norm[step_i, :actual_action_dim],
+                )
+                gripper = action_raw[-1]
+                gripper = -np.sign(gripper * 2.0 - 1.0)
+                action_raw[-1] = gripper
+
+                obs, reward, done, info = env.step(action_raw)
+                t += 1
+                steps_this_cycle += 1
+                _record_frame(obs, replay_images)
+
+                if done:
+                    break
+
+            start_wp = end_wp.copy()
+
+        if steps_this_cycle == 0 and not done:
+            obs, reward, done, info = env.step(np.zeros(actual_action_dim))
+            t += 1
+
+    success = done and reward > 0
+    logger.info(
+        f"  {ep_label}episode done: steps={t}, replans={replan_count}, success={success}"
+    )
+    return success, replay_images
+
+
+# ---------------------------------------------------------------------------
+# Parallel evaluation entry point
+# ---------------------------------------------------------------------------
+
+def evaluate_parallel(cfg, num_parallel: int = 4):
+    """Run LIBERO evaluation with *num_parallel* episodes in flight.
+
+    Architecture:
+        - 1 InferenceServer thread  (GPU, batches VLM/AE requests)
+        - N episode worker threads  (CPU, run env.step in parallel)
+
+    MuJoCo's C core releases the GIL, so env.step() from different threads
+    truly runs in parallel.  All CUDA operations are serialized through the
+    single inference server thread (no contention).
+    """
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Device: {device} | parallel episodes: {num_parallel}")
+
+    t_total = time.time()
+
+    use_joint = "joint_checkpoint" in cfg
+    if use_joint:
+        joint_model = load_joint(cfg, device)
+        vlm = joint_model
+        ae_model = joint_model
+        logger.info(f"Joint model loaded: {time.time() - t_total:.1f}s")
+    else:
+        vlm = load_vlm(cfg, device)
+        ae_model = load_ae(cfg, device)
+        logger.info(f"Separate VLM+AE loaded: {time.time() - t_total:.1f}s")
+
+    pg_tok = load_pg_tokenizer()
+    rc = get_robot_config("libero")
+    stats = load_dataset_statistics(cfg["dataset_statistics_path"])
+    norm_helper = NormalizationHelper(stats, cfg.get("norm_type", "q99"))
+    if rc.action_norm_mask is not None:
+        norm_helper.action_norm_mask = rc.action_norm_mask
+
+    wp_tokenizer = WaypointTokenizer(
+        proprio_dim=rc.actual_proprio_dim,
+        num_waypoints=cfg.get("num_waypoints", 7),
+        max_token_len=cfg.get("max_token_len", 256),
+    )
+
+    video_out_path = pathlib.Path(cfg.get("video_out_path", "data/libero/videos"))
+    video_out_path.mkdir(parents=True, exist_ok=True)
+
+    server = InferenceServer(
+        vlm=vlm,
+        ae_model=ae_model,
+        wp_tokenizer=wp_tokenizer,
+        device=device,
+        pg_tok=pg_tok,
+        max_batch=num_parallel,
+        max_wait_ms=8,
+    )
+    server.start()
+
+    from libero.libero import benchmark
+
+    task_suite_name = cfg.get("task_suite", "libero_object")
+    bm = benchmark.get_benchmark_dict()[task_suite_name]()
+    num_tasks = bm.n_tasks
+    num_trials = cfg.get("num_trials_per_task", 3)
+
+    episode_specs = []
+    for task_idx in range(num_tasks):
+        task = bm.get_task(task_idx)
+        initial_states = bm.get_task_init_states(task_idx)
+        for trial in range(min(num_trials, len(initial_states))):
+            episode_specs.append({
+                "task_idx": task_idx,
+                "trial": trial,
+                "task_name": task.name,
+                "task_desc": task.language,
+                "initial_state": initial_states[trial],
+                "bddl_file": bm.get_task_bddl_file_path(task_idx),
+            })
+
+    logger.info(
+        f"Total episodes: {len(episode_specs)} "
+        f"({num_tasks} tasks x {num_trials} trials), parallel={num_parallel}"
+    )
+
+    results_lock = threading.Lock()
+    results_by_task: dict[str, dict] = {}
+    counters = {"success": 0, "done": 0}
+
+    env_create_lock = threading.Lock()
+
+    def _run_one(spec):
+        from libero.libero.envs import OffScreenRenderEnv
+
+        tidx, trial = spec["task_idx"], spec["trial"]
+        label = f"T{tidx}t{trial} "
+
+        env_args = {
+            "bddl_file_name": spec["bddl_file"],
+            "camera_heights": 256,
+            "camera_widths": 256,
+        }
+        with env_create_lock:
+            env = OffScreenRenderEnv(**env_args)
+            env.seed(0)
+
+        t_ep = time.time()
+        try:
+            success, replay_images = run_episode_with_server(
+                server, wp_tokenizer, norm_helper,
+                env, spec["initial_state"], spec["task_desc"],
+                cfg, pg_tok, ep_label=label,
+            )
+        except Exception as exc:
+            logger.error(f"{label}episode crashed: {exc}", exc_info=True)
+            success = False
+            replay_images = []
+        finally:
+            env.close()
+
+        ep_secs = time.time() - t_ep
+
+        suffix = "success" if success else "failure"
+        task_segment = spec["task_desc"].replace(" ", "_")
+        if replay_images:
+            vf = video_out_path / f"rollout_{task_segment}_t{trial}_{suffix}.mp4"
+            imageio.mimwrite(str(vf), [np.asarray(x) for x in replay_images], fps=10)
+
+        with results_lock:
+            counters["done"] += 1
+            if success:
+                counters["success"] += 1
+            tn = spec["task_name"]
+            if tn not in results_by_task:
+                results_by_task[tn] = {"successes": 0, "trials": 0}
+            results_by_task[tn]["trials"] += 1
+            if success:
+                results_by_task[tn]["successes"] += 1
+            sr = counters["success"] / max(counters["done"], 1)
+
+        logger.info(
+            f"  {label}{'SUCCESS' if success else 'FAILURE'} ({ep_secs:.1f}s) | "
+            f"overall: {counters['success']}/{counters['done']} = {sr:.2%}"
+        )
+        return spec, success
+
+    try:
+        with ThreadPoolExecutor(max_workers=num_parallel) as pool:
+            futures = [pool.submit(_run_one, s) for s in episode_specs]
+            for fut in as_completed(futures):
+                try:
+                    fut.result()
+                except Exception as exc:
+                    logger.error(f"Episode thread error: {exc}", exc_info=True)
+    finally:
+        server.stop()
+
+    overall_rate = counters["success"] / max(counters["done"], 1)
+    logger.info(f"\n{'=' * 60}")
+    logger.info(f"Overall success rate: {overall_rate:.2%} ({counters['success']}/{counters['done']})")
+    for name, r in results_by_task.items():
+        sr = r["successes"] / max(r["trials"], 1)
+        logger.info(f"  {name}: {sr:.2%} ({r['successes']}/{r['trials']})")
+    logger.info(f"Total eval time: {time.time() - t_total:.1f}s")
+
+    return results_by_task
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def main():
     logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
+    parser.add_argument(
+        "--num_parallel", type=int, default=1,
+        help="Number of episodes to run in parallel (1 = original serial mode).",
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    evaluate(cfg)
+    if args.num_parallel > 1:
+        evaluate_parallel(cfg, num_parallel=args.num_parallel)
+    else:
+        evaluate(cfg)
 
 
 if __name__ == "__main__":
