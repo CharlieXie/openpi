@@ -72,6 +72,7 @@ class WaypointVLMDataset(IterableDataset):
         shuffle_buffer_size: int = 5000,
         image_aug: bool = False,
         image_aug_cfg: dict | None = None,
+        episode_shuffle_buffer: int = 0,
     ):
         super().__init__()
         self.wp_rlds_dir = wp_rlds_dir
@@ -82,6 +83,7 @@ class WaypointVLMDataset(IterableDataset):
         self.stride = stride
         self.image_size = image_size
         self.shuffle_buffer_size = shuffle_buffer_size
+        self.episode_shuffle_buffer = episode_shuffle_buffer
 
         self.norm_helper = NormalizationHelper(dataset_statistics, norm_type)
 
@@ -92,11 +94,18 @@ class WaypointVLMDataset(IterableDataset):
 
         logger.info(
             f"WaypointVLMDataset: dir={wp_rlds_dir}, M={num_waypoints}, stride={stride}, "
-            f"robot={robot_config.robot_type}, image_aug={image_aug}"
+            f"robot={robot_config.robot_type}, image_aug={image_aug}, "
+            f"episode_shuffle_buffer={episode_shuffle_buffer}"
         )
 
     def _raw_sample_iter(self):
-        """Yield tokenized samples from waypoint-filtered RLDS."""
+        """Yield tokenized samples from waypoint-filtered RLDS.
+
+        When episode_shuffle_buffer > 0, episodes are shuffled at the TF
+        dataset level to mix data across task suites.  VLM does not use
+        external index files, so no enumerate() is needed — shard() +
+        shuffle() suffice.
+        """
         import tensorflow as tf
         import tensorflow_datasets as tfds
 
@@ -114,13 +123,19 @@ class WaypointVLMDataset(IterableDataset):
 
         rc = self.robot_config
         M = self.num_waypoints
+        use_episode_shuffle = self.episode_shuffle_buffer > 0
 
         while True:
             builder = tfds.builder_from_directory(self.wp_rlds_dir)
             dataset = builder.as_dataset(split="train")
 
+            if use_episode_shuffle:
+                if world_size > 1:
+                    dataset = dataset.shard(world_size, rank)
+                dataset = dataset.shuffle(buffer_size=self.episode_shuffle_buffer)
+
             for ep_idx, episode in enumerate(dataset):
-                if ep_idx % world_size != rank:
+                if not use_episode_shuffle and ep_idx % world_size != rank:
                     continue
 
                 steps = list(episode["steps"])

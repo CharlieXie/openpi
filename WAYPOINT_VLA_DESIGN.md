@@ -1,6 +1,6 @@
 # Waypoint VLA — openpi 实现设计文档
 
-> 最后更新: 2026-03-21 (rev 7 — Proprio 300-bin + Gripper 二值化 Token)
+> 最后更新: 2026-03-22 (rev 8 — 多 Task Suite 联合训练 + Episode Shuffle)
 > 基于 Pi0.5 (PyTorch) 在 openpi 项目中实现两段式 Waypoint VLA 系统
 
 ---
@@ -968,3 +968,139 @@ VLM 解码 waypoint: 6D continuous (300-bin decode) + 1D gripper (1.0/0.0)
 2. 冒烟测试 joint training 1 步确认无报错
 3. 确认 VLM loss 和 AE loss 正常下降
 4. 推理验证: 确认 gripper token 预测正确 (全开/全关 pattern 符合任务逻辑)
+
+---
+
+## 十六、多 Task Suite 联合训练 + Episode Shuffle (rev 8)
+
+### 动机
+
+之前每个 LIBERO task suite (spatial / object / goal / libero_10) 独立训练。现在需要将 4 个 suite 混合在一起联合训练，以学习跨任务的通用特征。
+
+合并后数据按 suite 顺序排列在 RLDS 中：
+
+```
+spatial (ep 0-431) → object (ep 432-885) → goal (ep 886-1313) → libero_10 (ep 1314-1692)
+```
+
+如果不打乱，每个 epoch 前 ~25% 的 step 全是 spatial，然后全是 object……产生类似 catastrophic forgetting 的效应，梯度偏移严重。
+
+### 数据规模
+
+| Suite | Episodes | AE pairs | VLM windows |
+|-------|----------|----------|-------------|
+| spatial | 432 | 7,977 | 7,977 |
+| object | 454 | 8,409 | 8,409 |
+| goal | 428 | 7,187 | 7,188 |
+| libero_10 | 379 | 12,486 | 12,487 |
+| **Total** | **1,693** | **36,059** | **36,061** |
+
+### 数据资产路径
+
+| 用途 | 路径 |
+|------|------|
+| 合并原始 RLDS (AE 训练) | `/workspace/data/modified_libero_rlds/libero_all_no_noops/1.0.0/` |
+| Waypoint-filtered RLDS (VLM 训练) | `/workspace/data/libero_object_wp_001/waypoint_filtered_rlds__libero/1.0.0/` |
+| Waypoint indices JSON (AE 训练) | `/workspace/data/libero_object_wp_001/waypoint_indices.json` |
+| 归一化统计量 | `/workspace/data/modified_libero_rlds/dataset_statistics.json` |
+
+### 两层 Shuffle 设计
+
+仅靠 sample-level shuffle buffer 无法跨 suite 混合（最大 suite 有 12,486 个样本，buffer 需要 >12,000 才能跨越，内存代价 ~3.5GB+）。因此采用两层 shuffle：
+
+**第 1 层：Episode 级 shuffle (TF dataset 层)**
+
+在 TFDS `as_dataset()` 之后，对 episode 调用 `dataset.shuffle(buffer_size=N)`，打乱 episode 读取顺序。Episode 对象是 TF 的 lazy 引用（不含图像数据），内存开销可忽略。
+
+**第 2 层：Sample 级 shuffle (Python reservoir buffer)**
+
+现有的 `__iter__()` shuffle buffer，负责 episode 内部和相邻 episode 间的样本混合。适当增大 buffer 即可。
+
+### 关键实现细节 — AE 的 `ep_idx` 映射问题
+
+**问题**：AE dataset 用 `episode_wp_map[ep_idx]` 查询 waypoint indices，其中 `ep_idx` 来自 `enumerate(dataset)` 的顺序枚举，假设与 `waypoint_indices.json` 中的 `src_ep_idx` 一一对应。如果 shuffle 后 episode 顺序变了，`enumerate()` 给出的索引不再匹配原始 `src_ep_idx`，会导致**用错误的 waypoint indices 处理 episode，训练数据无声损坏**。
+
+**解决**：使用 `tf.data.Dataset.enumerate()` 在 shuffle 之前绑定原始索引：
+
+```python
+# enumerate() 在 shard/shuffle 之前调用，
+# 每个 episode 携带其原始顺序索引
+dataset = dataset.enumerate()        # (orig_idx, episode) pairs
+dataset = dataset.shard(W, rank)     # DDP 分片
+dataset = dataset.shuffle(buf)       # episode 级 shuffle
+
+for orig_idx_tensor, episode in dataset:
+    ep_idx = int(orig_idx_tensor.numpy())  # 原始 src_ep_idx
+    wp_pairs = self.episode_wp_map.get(ep_idx)  # 正确查找
+```
+
+**VLM dataset 不需要 `enumerate()`**，因为它不依赖外部索引文件，所有信息从 episode 内部读取。
+
+### DDP 兼容
+
+旧代码用 `if ep_idx % world_size != rank: continue` 做手动分片——每个 rank 都读取所有 episode，浪费 IO。新代码用 `dataset.shard(world_size, rank)` 在 TF 层面分片，只读取属于本 rank 的 episode。
+
+对于 AE，`enumerate()` 在 `shard()` 之前，确保原始索引正确：
+
+```
+enumerate: (0,ep0), (1,ep1), (2,ep2), (3,ep3), ...
+shard(2,0): (0,ep0), (2,ep2), (4,ep4), ...    ← 原始索引保留
+shuffle:    (4,ep4), (0,ep0), (2,ep2), ...    ← 原始索引仍然正确
+```
+
+### 向后兼容
+
+- `episode_shuffle_buffer` 默认为 0，走 legacy 路径（顺序读取 + 手动 DDP 分片）
+- 旧配置 `waypoint_joint_libero.yaml` 无需修改
+- `train_waypoint.py`（独立训练脚本）不传此参数，不受影响
+
+### 修改文件清单
+
+| 文件 | 修改内容 |
+|------|----------|
+| `ae_dataset.py` | 新增 `episode_shuffle_buffer` 参数; 提取 `_process_episode()` 方法; `_raw_sample_iter()` 新增 `enumerate()` + `shard()` + `shuffle()` 路径 |
+| `vlm_dataset.py` | 新增 `episode_shuffle_buffer` 参数; `_raw_sample_iter()` 新增 `shard()` + `shuffle()` 路径 |
+| `train_waypoint_joint.py` | 从 config 读取 `episode_shuffle_buffer_size` 传给两个 dataset |
+| `waypoint_joint_libero_all.yaml` | **新建** — 合并数据路径 + shuffle 参数 + 调整 train steps |
+
+### 配置参数
+
+```yaml
+# Episode-level shuffle (TF dataset layer)
+# 500 covers ~30% of 1693 episodes, enough to interleave all 4 suites.
+# Episode objects are lazy TF references — memory cost is negligible.
+episode_shuffle_buffer_size: 500
+
+# Sample-level shuffle (Python reservoir buffer)
+# Increased from single-suite defaults.
+vlm_shuffle_buffer_size: 10000   # ~3 GB
+ae_shuffle_buffer_size: 5000     # ~1.5 GB
+
+# Training steps (~4x data → ~4x steps)
+num_train_steps: 5000
+warmup_steps: 100
+```
+
+### 训练命令
+
+```bash
+cd /workspace/openpi
+
+# 单卡
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+.venv/bin/python scripts/train_waypoint_joint.py \
+    --config configs/waypoint_joint_libero_all.yaml
+
+# 双卡 DDP
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+.venv/bin/torchrun --standalone --nnodes=1 --nproc_per_node=2 \
+    scripts/train_waypoint_joint.py \
+    --config configs/waypoint_joint_libero_all.yaml
+```
+
+### 验证清单
+
+1. 冒烟测试 joint training 1 步确认无报错
+2. 检查日志中 `WaypointAEDataset` 和 `WaypointVLMDataset` 的 `episode_shuffle_buffer=500` 输出
+3. 观察 wandb loss 曲线是否比不 shuffle 时更平滑（无 suite 切换跳变）
+4. 对比实验：shuffle vs 不 shuffle 的最终 eval 成功率

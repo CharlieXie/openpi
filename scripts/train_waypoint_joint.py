@@ -69,6 +69,7 @@ def train_joint(cfg, device, use_ddp, is_main):
         shuffle_buffer_size=cfg.get("vlm_shuffle_buffer_size", 5000),
         image_aug=cfg.get("image_aug", False),
         image_aug_cfg=cfg.get("image_aug_cfg", None),
+        episode_shuffle_buffer=cfg.get("episode_shuffle_buffer_size", 0),
     )
     vlm_collator = WaypointVLMCollator()
     vlm_loader = torch.utils.data.DataLoader(
@@ -87,6 +88,7 @@ def train_joint(cfg, device, use_ddp, is_main):
         model_action_dim=cfg.get("model_action_dim", 32),
         model_proprio_dim=cfg.get("model_proprio_dim", 32),
         shuffle_buffer_size=cfg.get("ae_shuffle_buffer_size", 1000),
+        episode_shuffle_buffer=cfg.get("episode_shuffle_buffer_size", 0),
     )
     ae_collator = WaypointAECollator()
     ae_loader = torch.utils.data.DataLoader(

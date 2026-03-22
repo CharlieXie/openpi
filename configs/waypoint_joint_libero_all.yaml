@@ -1,0 +1,106 @@
+# Waypoint Joint (VLM + AE) training config — LIBERO ALL (4 suites combined)
+# Usage: torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_waypoint_joint.py --config configs/waypoint_joint_libero_all.yaml
+#
+# Combined dataset: spatial(432ep) + object(454ep) + goal(428ep) + libero_10(379ep) = 1693 episodes
+# Total AE pairs: ~36,059   Total VLM windows: ~36,061
+
+robot_type: libero
+
+# --- Data paths (combined libero_all) ---
+# AE data (original RLDS with all steps)
+original_rlds_dir: /workspace/data/modified_libero_rlds/libero_all_no_noops/1.0.0
+wp_indices_path: /workspace/data/libero_object_wp_001/waypoint_indices.json
+# VLM data (waypoint-filtered RLDS)
+wp_rlds_dir: /workspace/data/libero_object_wp_001/waypoint_filtered_rlds__libero/1.0.0
+# Shared normalization statistics (computed over all 4 suites)
+dataset_statistics_path: /workspace/data/modified_libero_rlds/dataset_statistics.json
+
+# --- Model architecture ---
+paligemma_variant: gemma_2b
+action_expert_variant: gemma_300m
+precision: bfloat16
+
+# Model dimensions (AE)
+model_action_dim: 32
+model_proprio_dim: 32
+horizon_steps: 32
+max_duration: 32
+ae_max_token_len: 64
+
+# Waypoint config (VLM)
+num_waypoints: 7
+vlm_max_token_len: 256
+stride: 1
+
+# Pretrained weights (Pi0.5 base)
+pretrained_weight_path: /workspace/models/pi05_base_pytorch
+
+# --- Joint training ---
+gradient_strategy: scale_gradient       # "none" | "stop_gradient" | "scale_gradient" | "freeze_backbone"
+gradient_scale: 0.3                     # only used when gradient_strategy=scale_gradient
+ae_loss_weight: 1.0
+
+# Batch sizes (per GPU)
+vlm_batch_size: 192
+ae_batch_size: 192
+
+# Training hyperparameters
+# ~4x more data than single suite → ~4x more steps
+num_train_steps: 5000
+warmup_steps: 100
+peak_lr: 1.0e-4
+end_lr: 1.0e-7
+
+# Normalization
+norm_type: q99
+
+# Image augmentation — VLM
+image_aug: true
+image_aug_cfg:
+  random_resized_crop_scale: [0.9, 1.0]
+  brightness: 0.2
+  contrast: [0.8, 1.2]
+  saturation: [0.8, 1.2]
+  hue: 0.05
+
+# Image augmentation — AE
+ae_image_aug_cfg:
+  crop_scale: 0.95
+  rotation_deg: 5.0
+  brightness_lo: 0.7
+  brightness_hi: 1.3
+  contrast_lo: 0.6
+  contrast_hi: 1.4
+  saturation_lo: 0.5
+  saturation_hi: 1.5
+
+# --- Shuffle ---
+# Episode-level shuffle (TF dataset layer): shuffles episode reading order
+# to mix data across the 4 task suites. Value = number of episodes held in
+# the TF shuffle buffer.  500 covers ~30% of 1693 episodes — enough to
+# interleave all suites.  Episode elements are lazy TF references so memory
+# cost is negligible.
+episode_shuffle_buffer_size: 500
+
+# Sample-level shuffle (reservoir buffer in Python):
+# Increased from single-suite defaults to improve cross-episode mixing.
+# 10000 VLM samples ≈ 3 GB, 5000 AE samples ≈ 1.5 GB.
+vlm_shuffle_buffer_size: 10000
+ae_shuffle_buffer_size: 5000
+
+# Logging and checkpointing
+exp_name: waypoint_joint_libero_all
+checkpoint_dir: checkpoints/{exp_name}
+save_interval: 200
+log_interval: 3
+wandb_enabled: true
+wandb_project: waypoint_e2e
+
+# LoRA (set to true for low-memory training)
+lora_enabled: false
+lora_rank: 16
+lora_alpha: 16.0
+train_vision_encoder: true
+
+# Resume from checkpoint
+resume: false
