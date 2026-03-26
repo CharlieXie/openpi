@@ -17,6 +17,7 @@ import argparse
 import contextlib
 import json
 import logging
+import math
 import pathlib
 import time
 from pathlib import Path
@@ -87,8 +88,36 @@ def get_proprio_from_obs(obs):
     return np.concatenate([eef_pos, eef_rot, gripper]).astype(np.float32)
 
 
-def get_libero_images(env, obs, size=224):
-    """Extract camera images from LIBERO observation."""
+def center_crop_and_resize(img_array: np.ndarray, crop_scale: float, target_size: int = 224) -> np.ndarray:
+    """Center crop with area ratio ``crop_scale``, then resize back to ``target_size``.
+
+    Inference-time deterministic equivalent of training's
+    ``RandomResizedCrop(target_size, scale=(lo, hi), ratio=(1, 1))``.
+    Set ``crop_scale`` to the midpoint of ``(lo, hi)`` for a representative crop.
+    """
+    from PIL import Image as PILImage
+    h, w = img_array.shape[:2]
+    side_ratio = math.sqrt(crop_scale)
+    crop_h = int(round(h * side_ratio))
+    crop_w = int(round(w * side_ratio))
+    start_h = (h - crop_h) // 2
+    start_w = (w - crop_w) // 2
+    cropped = img_array[start_h:start_h + crop_h, start_w:start_w + crop_w]
+    if cropped.shape[0] != target_size or cropped.shape[1] != target_size:
+        cropped = np.array(
+            PILImage.fromarray(cropped).resize((target_size, target_size), PILImage.BILINEAR),
+            dtype=np.uint8,
+        )
+    return cropped
+
+
+def get_libero_images(env, obs, size=224, center_crop_scale=None):
+    """Extract camera images from LIBERO observation.
+
+    If ``center_crop_scale`` is not None, a center crop with the given area
+    ratio is applied after resize — matching the inference-time equivalent of
+    training's ``RandomResizedCrop`` augmentation.
+    """
     global _image_frame_idx
     from PIL import Image as PILImage
     images = {}
@@ -97,26 +126,20 @@ def get_libero_images(env, obs, size=224):
         img = PILImage.fromarray(agentview[::-1, ::-1])
         if img.size != (size, size):
             img = img.resize((size, size), PILImage.BILINEAR)
-        images["base_0_rgb"] = np.array(img, dtype=np.uint8)
+        arr = np.array(img, dtype=np.uint8)
+        if center_crop_scale is not None:
+            arr = center_crop_and_resize(arr, center_crop_scale, size)
+        images["base_0_rgb"] = arr
 
     wrist = obs.get("robot0_eye_in_hand_image", obs.get("robot0_eye_in_hand_rgb"))
     if wrist is not None:
         img = PILImage.fromarray(wrist[::-1, ::-1])
         if img.size != (size, size):
             img = img.resize((size, size), PILImage.BILINEAR)
-        images["left_wrist_0_rgb"] = np.array(img, dtype=np.uint8)
-
-    # if _image_save_dir is not None and images:
-    #     frames = []
-    #     if "base_0_rgb" in images:
-    #         frames.append(images["base_0_rgb"])
-    #     if "left_wrist_0_rgb" in images:
-    #         frames.append(images["left_wrist_0_rgb"])
-    #     if frames:
-    #         combined = np.concatenate(frames, axis=1)
-    #         save_path = pathlib.Path(_image_save_dir) / f"frame_{_image_frame_idx:06d}.png"
-    #         PILImage.fromarray(combined).save(str(save_path))
-    #         _image_frame_idx += 1
+        arr = np.array(img, dtype=np.uint8)
+        if center_crop_scale is not None:
+            arr = center_crop_and_resize(arr, center_crop_scale, size)
+        images["left_wrist_0_rgb"] = arr
 
     return images
 
@@ -475,6 +498,7 @@ def run_episode(
     actual_action_dim = rc.actual_action_dim
     max_steps = MAX_STEPS_MAP.get(cfg.get("task_suite", "libero_object"), 280)
     num_steps_wait = cfg.get("num_steps_wait", 10)
+    crop_scale = cfg.get("center_crop_scale") if cfg.get("center_crop", False) else None
 
     t = 0
     done = False
@@ -507,7 +531,7 @@ def run_episode(
             else:
                 replay_images.append(head_frame)
 
-        images = get_libero_images(env, obs)
+        images = get_libero_images(env, obs, center_crop_scale=crop_scale)
         proprio_raw = get_proprio_from_obs(obs)
         # Split into continuous + binary gripper
         continuous_raw, gripper_binary = rc.split_proprio(proprio_raw)
@@ -555,7 +579,7 @@ def run_episode(
 
             end_wp = pad_to_dim(proprio_values, model_proprio_dim)
 
-            fresh_images = get_libero_images(env, obs)
+            fresh_images = get_libero_images(env, obs, center_crop_scale=crop_scale)
             t_ae = time.time()
             actions_norm = predict_actions(
                 ae_model, fresh_images, task_desc, start_wp, end_wp, duration, device, pg_tok,
@@ -648,6 +672,12 @@ def evaluate(cfg):
         max_token_len=cfg.get("max_token_len", 256),
         use_gripper_token=True,
     )
+
+    if cfg.get("center_crop", False):
+        logger.info(
+            f"Center crop enabled: area_scale={cfg.get('center_crop_scale', 0.95)}, "
+            f"side_ratio={math.sqrt(cfg.get('center_crop_scale', 0.95)):.4f}"
+        )
 
     video_out_path = pathlib.Path(cfg.get("video_out_path", "data/libero/videos"))
     video_out_path.mkdir(parents=True, exist_ok=True)

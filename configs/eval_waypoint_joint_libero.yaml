@@ -33,6 +33,13 @@ norm_type: q99
 # Inference optimization
 torch_compile: true
 
+# Center crop — inference equivalent of training's RandomResizedCrop.
+# Enable when the model was trained with image_aug: true + RandomResizedCrop.
+# center_crop_scale should be the midpoint of training's scale range,
+# e.g. (0.9 + 1.0) / 2 = 0.95 for random_resized_crop_scale: [0.9, 1.0].
+center_crop: false
+center_crop_scale: 0.95
+
 # Evaluation
 num_trials_per_task: 50
 num_steps_wait: 10
