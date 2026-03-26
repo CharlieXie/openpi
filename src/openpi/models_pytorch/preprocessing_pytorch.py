@@ -50,8 +50,9 @@ def preprocess_observation_pytorch(
             logger.info(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")
             image = image_tools.resize_with_pad_torch(image, *image_resolution)
 
-        if train:
-            _aug = aug_cfg or {}
+        if train and aug_cfg is not None:
+            _aug = aug_cfg
+            enable_crop   = bool(_aug.get("enable_random_crop", True))
             crop_scale    = float(_aug.get("crop_scale", 0.95))
             rotation_deg  = float(_aug.get("rotation_deg", 5.0))
             brightness_lo = float(_aug.get("brightness_lo", 0.7))
@@ -67,22 +68,23 @@ def preprocess_observation_pytorch(
             if "wrist" not in key:
                 height, width = image.shape[1:3]
 
-                crop_height = int(height * crop_scale)
-                crop_width  = int(width  * crop_scale)
+                if enable_crop:
+                    crop_height = int(height * crop_scale)
+                    crop_width  = int(width  * crop_scale)
 
-                max_h = height - crop_height
-                max_w = width  - crop_width
-                if max_h > 0 and max_w > 0:
-                    start_h = torch.randint(0, max_h + 1, (1,), device=image.device)
-                    start_w = torch.randint(0, max_w + 1, (1,), device=image.device)
-                    image = image[:, start_h : start_h + crop_height, start_w : start_w + crop_width, :]
+                    max_h = height - crop_height
+                    max_w = width  - crop_width
+                    if max_h > 0 and max_w > 0:
+                        start_h = torch.randint(0, max_h + 1, (1,), device=image.device)
+                        start_w = torch.randint(0, max_w + 1, (1,), device=image.device)
+                        image = image[:, start_h : start_h + crop_height, start_w : start_w + crop_width, :]
 
-                image = torch.nn.functional.interpolate(
-                    image.permute(0, 3, 1, 2),
-                    size=(height, width),
-                    mode="bilinear",
-                    align_corners=False,
-                ).permute(0, 2, 3, 1)
+                    image = torch.nn.functional.interpolate(
+                        image.permute(0, 3, 1, 2),
+                        size=(height, width),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).permute(0, 2, 3, 1)
 
                 angle = torch.rand(1, device=image.device) * (2 * rotation_deg) - rotation_deg
                 if torch.abs(angle) > 0.1:

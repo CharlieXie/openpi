@@ -33,21 +33,22 @@ def build_image_augmentation(aug_cfg: dict | None = None) -> T.Compose:
     if aug_cfg is None:
         aug_cfg = {}
 
+    enable_crop = aug_cfg.get("enable_random_resized_crop", True)
     crop_scale = tuple(aug_cfg.get("random_resized_crop_scale", [0.9, 1.0]))
     brightness = aug_cfg.get("brightness", 0.2)
     contrast = tuple(aug_cfg.get("contrast", [0.8, 1.2]))
     saturation = tuple(aug_cfg.get("saturation", [0.8, 1.2]))
     hue = aug_cfg.get("hue", 0.05)
 
-    tfms = [
-        T.RandomResizedCrop(224, scale=crop_scale, ratio=(1.0, 1.0), antialias=True),
-        T.ColorJitter(
-            brightness=brightness,
-            contrast=contrast,
-            saturation=saturation,
-            hue=hue,
-        ),
-    ]
+    tfms = []
+    if enable_crop:
+        tfms.append(T.RandomResizedCrop(224, scale=crop_scale, ratio=(1.0, 1.0), antialias=True))
+    tfms.append(T.ColorJitter(
+        brightness=brightness,
+        contrast=contrast,
+        saturation=saturation,
+        hue=hue,
+    ))
     return T.Compose(tfms)
 
 

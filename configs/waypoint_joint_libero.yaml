@@ -5,12 +5,12 @@ robot_type: libero
 
 # --- Data paths ---
 # AE data
-original_rlds_dir: /workspace/data/object/libero_object_no_noops/libero_object_no_noops/1.0.0
-wp_indices_path: /workspace/data/object/libero_object_wp_001/waypoint_indices.json
+original_rlds_dir: /projects/chuanlia001ssd/data/libero_all/whole/data/modified_libero_rlds/libero_all_no_noops/1.0.0
+wp_indices_path: /projects/chuanlia001ssd/data/libero_all/whole/data/libero_object_wp_001/waypoint_indices.json
 # VLM data
-wp_rlds_dir: /workspace/data/object/libero_object_wp_001/waypoint_filtered_rlds__libero/1.0.0
+wp_rlds_dir: /projects/chuanlia001ssd/data/libero_all/whole/data/libero_object_wp_001/waypoint_filtered_rlds__libero/1.0.0
 # Shared
-dataset_statistics_path: /workspace/openpi/data
+dataset_statistics_path: /projects/chuanlia001ssd/data/libero_all/whole/data
 
 # --- Model architecture ---
 paligemma_variant: gemma_2b
@@ -30,11 +30,11 @@ vlm_max_token_len: 256
 stride: 1
 
 # Pretrained weights (Pi0.5 base)
-pretrained_weight_path: /workspace/models/pi05_base_pytorch
+pretrained_weight_path: /projects/chuanlia001ssd/models/pi05_base_pytorch
 
 # --- Joint training ---
 gradient_strategy: scale_gradient       # "none" | "stop_gradient" | "scale_gradient" | "freeze_backbone"
-gradient_scale: 0.3                     # only used when gradient_strategy=scale_gradient (fraction of AE gradient flowing into backbone K/V)
+gradient_scale: 0.1                     # only used when gradient_strategy=scale_gradient (fraction of AE gradient flowing into backbone K/V)
 ae_loss_weight: 1.0
 
 # Batch sizes (per GPU)
@@ -42,25 +42,28 @@ vlm_batch_size: 192
 ae_batch_size: 192
 
 # Training hyperparameters
-num_train_steps: 1200
+num_train_steps: 2200
 warmup_steps: 40
-peak_lr: 1.0e-4
+peak_lr: 9.0e-5
 end_lr: 1.0e-7
 
 # Normalization
 norm_type: q99
 
 # Image augmentation — VLM
-image_aug: true
+image_aug: false
 image_aug_cfg:
-  random_resized_crop_scale: [0.9, 1.0]
+  enable_random_resized_crop: false      # toggle RandomResizedCrop independently
+  # random_resized_crop_scale: [0.9, 1.0]
   brightness: 0.2
   contrast: [0.8, 1.2]
   saturation: [0.8, 1.2]
   hue: 0.05
 
 # Image augmentation — AE
+ae_image_aug: false
 ae_image_aug_cfg:
+  enable_random_crop: false              # toggle RandomCrop+Resize independently
   crop_scale: 0.95
   rotation_deg: 5.0
   brightness_lo: 0.7
@@ -75,7 +78,7 @@ vlm_shuffle_buffer_size: 5000
 ae_shuffle_buffer_size: 1000
 
 # Logging and checkpointing
-exp_name: waypoint_joint_libero_sg_03
+exp_name: waypoint_joint_libero_sg_0.1
 checkpoint_dir: checkpoints/{exp_name}
 save_interval: 100
 log_interval: 3

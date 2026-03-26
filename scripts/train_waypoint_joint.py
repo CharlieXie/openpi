@@ -112,7 +112,7 @@ def train_joint(cfg, device, use_ddp, is_main):
         vlm_max_token_len=cfg.get("vlm_max_token_len", 256),
         gradient_strategy=cfg.get("gradient_strategy", "none"),
         gradient_scale=cfg.get("gradient_scale", 0.1),
-        aug_cfg=cfg.get("ae_image_aug_cfg", None),
+        aug_cfg=cfg.get("ae_image_aug_cfg", None) if cfg.get("ae_image_aug", False) else None,
     ).to(device)
     model.gradient_checkpointing_enable()
     if is_main:
@@ -191,7 +191,7 @@ def train_joint(cfg, device, use_ddp, is_main):
     if is_main:
         total_p, trainable_p = count_params(model)
         logging.info(f"Model: {total_p/1e6:.1f}M total, {trainable_p/1e6:.1f}M trainable")
-        if wandb.run and wandb.run.mode != "disabled":
+        if wandb.run and getattr(wandb.run, "mode", None) != "disabled":
             wandb.run.summary["total_params"] = total_p
             wandb.run.summary["trainable_params"] = trainable_p
             wandb.run.summary["gradient_strategy"] = gradient_strategy
