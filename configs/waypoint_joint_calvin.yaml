@@ -5,12 +5,12 @@ robot_type: calvin
 
 # --- Data paths ---
 # AE data
-original_rlds_dir: /workspace/data/calvin_abc_rlds/1.0.0
-wp_indices_path: /workspace/calvin_abc_wp_001/waypoint_indices.json
+original_rlds_dir: /workspace/data/calvin_abc_rlds
+wp_indices_path: /workspace/data/calvin_abc_wp_0_02/waypoint_indices.json
 # VLM data
-wp_rlds_dir: /workspace/calvin_abc_wp_001/calvin_abc_wp/1.0.0
+wp_rlds_dir: /workspace/data/calvin_abc_wp_0_02/calvin_abc_wp/1.0.0
 # Shared
-dataset_statistics_path: /workspace/calvin_abc_wp_001/norm_stats
+dataset_statistics_path: /workspace/data/calvin_abc_rlds/dataset_statistics.json
 
 # --- Model architecture ---
 paligemma_variant: gemma_2b
@@ -30,11 +30,11 @@ vlm_max_token_len: 256
 stride: 1
 
 # Pretrained weights (Pi0.5 base)
-pretrained_weight_path: /workspace/models/pi05_base_pytorch
+pretrained_weight_path: /workspace/models
 
 # --- Joint training ---
 gradient_strategy: scale_gradient       # "none" | "stop_gradient" | "scale_gradient" | "freeze_backbone"
-gradient_scale: 0.3                     # only used when gradient_strategy=scale_gradient (fraction of AE gradient flowing into backbone K/V)
+gradient_scale: 0.1                     # only used when gradient_strategy=scale_gradient (fraction of AE gradient flowing into backbone K/V)
 ae_loss_weight: 1.0
 
 # Batch sizes (per GPU)
@@ -61,14 +61,14 @@ image_aug_cfg:
   saturation: [0.8, 1.2]
   hue: 0.05
 
-# Shuffle buffers
-vlm_shuffle_buffer_size: 5000
-ae_shuffle_buffer_size: 1000
+# Shuffle buffers (Calvin ~10x larger than LIBERO: ~171K VLM samples, ~153K AE pairs)
+vlm_shuffle_buffer_size: 20000
+ae_shuffle_buffer_size: 5000
 
 # Logging and checkpointing
-exp_name: waypoint_joint_calvin
+exp_name: waypoint_joint_calvin_sg_0.1_t1
 checkpoint_dir: checkpoints/{exp_name}
-save_interval: 100
+save_interval: 200
 log_interval: 3
 wandb_enabled: true
 wandb_project: waypoint_e2e
