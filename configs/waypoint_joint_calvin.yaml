@@ -1,0 +1,83 @@
+# Waypoint Joint (VLM + AE) training config — CALVIN (ABC_D split)
+# Usage: torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_waypoint_joint.py --config configs/waypoint_joint_calvin.yaml
+
+robot_type: calvin
+
+# --- Data paths ---
+# AE data
+original_rlds_dir: /workspace/data/calvin_abc_rlds/1.0.0
+wp_indices_path: /workspace/calvin_abc_wp_001/waypoint_indices.json
+# VLM data
+wp_rlds_dir: /workspace/calvin_abc_wp_001/calvin_abc_wp/1.0.0
+# Shared
+dataset_statistics_path: /workspace/calvin_abc_wp_001/norm_stats
+
+# --- Model architecture ---
+paligemma_variant: gemma_2b
+action_expert_variant: gemma_300m
+precision: bfloat16
+
+# Model dimensions (AE)
+model_action_dim: 32
+model_proprio_dim: 32
+horizon_steps: 32
+max_duration: 32
+ae_max_token_len: 64
+
+# Waypoint config (VLM)
+num_waypoints: 7
+vlm_max_token_len: 256
+stride: 1
+
+# Pretrained weights (Pi0.5 base)
+pretrained_weight_path: /workspace/models/pi05_base_pytorch
+
+# --- Joint training ---
+gradient_strategy: scale_gradient       # "none" | "stop_gradient" | "scale_gradient" | "freeze_backbone"
+gradient_scale: 0.3                     # only used when gradient_strategy=scale_gradient (fraction of AE gradient flowing into backbone K/V)
+ae_loss_weight: 1.0
+
+# Batch sizes (per GPU)
+vlm_batch_size: 192
+ae_batch_size: 192
+
+# Training hyperparameters
+num_train_steps: 5000
+warmup_steps: 100
+peak_lr: 1.0e-4
+end_lr: 1.0e-7
+
+# Normalization
+norm_type: q99
+
+# Image augmentation — shared by VLM and AE (aligned with VLA-Adapter)
+# Both branches use the same torchvision RandomResizedCrop + ColorJitter pipeline,
+# applied in their respective datasets (CPU / PIL level).
+image_aug: true
+image_aug_cfg:
+  random_resized_crop_scale: [0.9, 1.0]
+  brightness: 0.2
+  contrast: [0.8, 1.2]
+  saturation: [0.8, 1.2]
+  hue: 0.05
+
+# Shuffle buffers
+vlm_shuffle_buffer_size: 5000
+ae_shuffle_buffer_size: 1000
+
+# Logging and checkpointing
+exp_name: waypoint_joint_calvin
+checkpoint_dir: checkpoints/{exp_name}
+save_interval: 100
+log_interval: 3
+wandb_enabled: true
+wandb_project: waypoint_e2e
+
+# LoRA (set to true for low-memory training)
+lora_enabled: false
+lora_rank: 16
+lora_alpha: 16.0
+train_vision_encoder: true
+
+# Resume from checkpoint
+resume: false

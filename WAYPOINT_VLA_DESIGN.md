@@ -1,6 +1,6 @@
 # Waypoint VLA — openpi 实现设计文档
 
-> 最后更新: 2026-03-25 (rev 9 — 以联合训练为主体重构文档，补充 scale_gradient 策略)
+> 最后更新: 2026-03-27 (rev 10 — 新增 CALVIN ABC_D 支持)
 > 基于 Pi0.5 (PyTorch) 在 openpi 项目中实现两段式 Waypoint VLA 系统。联合训练 (joint training) 为主要训练范式，独立 VLM/AE 训练仅作为参考。
 
 ---
@@ -41,7 +41,8 @@ openpi/
 │   ├── vlm_dataset.py    # WaypointVLMDataset (RLDS → VLM token sequences)
 │   ├── ae_model.py       # PI0WaypointAE (独立 AE 模型)            ← legacy
 │   ├── vlm_model.py      # PI0WaypointVLM (独立 VLM 模型)          ← legacy
-│   └── eval_libero.py    # 两段式 LIBERO 评测管线 (支持联合/独立两种模式)
+│   ├── eval_libero.py    # 两段式 LIBERO 评测管线 (支持联合/独立两种模式)
+│   └── eval_calvin.py    # 两段式 CALVIN 评测管线 (chain-task 5 subtasks × 1000 sequences)
 ├── scripts/
 │   ├── train_waypoint_joint.py # 联合训练入口 — 主训练脚本
 │   └── train_waypoint.py       # 独立训练入口 (--mode ae|vlm)      ← legacy
@@ -51,7 +52,9 @@ openpi/
     ├── waypoint_ae_libero.yaml         # LIBERO AE 独立训练配置     ← legacy
     ├── waypoint_vlm_libero.yaml        # LIBERO VLM 独立训练配置    ← legacy
     ├── waypoint_ae_r1lite.yaml         # R1 Lite AE 训练配置
-    └── eval_waypoint_libero.yaml       # LIBERO 评测配置 (独立 VLM+AE)
+    ├── eval_waypoint_libero.yaml       # LIBERO 评测配置 (独立 VLM+AE)
+    ├── waypoint_joint_calvin.yaml      # CALVIN 联合训练配置
+    └── eval_waypoint_joint_calvin.yaml # CALVIN 评测配置 (联合模型)
 ```
 
 ---
@@ -85,6 +88,21 @@ openpi/
 - 23,039 个 episode, 5,108,454 原始步, 2,221,696 waypoint 步
 - Waypoint 提取 key: `joint_position_arm_left + joint_position_arm_right + gripper_changes`
 - 误差阈值: 0.001
+
+### CALVIN (ABC_D)
+
+| 用途 | 路径 |
+|------|------|
+| 原始 RLDS (AE 训练) | `/workspace/data/calvin_abc_rlds/1.0.0` |
+| Waypoint-filtered RLDS (VLM 训练) | `/workspace/calvin_abc_wp_001/calvin_abc_wp/1.0.0` |
+| Waypoint indices JSON (AE 训练) | `/workspace/calvin_abc_wp_001/waypoint_indices.json` |
+| 归一化统计量 | `/workspace/calvin_abc_wp_001/norm_stats` |
+
+**CALVIN 数据说明:**
+- Waypoint 使用 `awe/example/rlds_wp_extract_calvin_parallel.py` 提取
+- RLDS 中包含 `waypoint_duration` 和 `is_waypoint_end` 字段
+- 观测: `observation/rgb_static` (200x200), `observation/rgb_gripper` (84x84), `observation/state` (15D)
+- 动作: `action` (7D: delta_pos(3) + delta_euler(3) + gripper(1))
 
 ### 模型权重
 
@@ -148,6 +166,47 @@ RobotConfig(
 
 State dims 0-5 (连续): 单独做 q99 归一化 → 300-bin 量化
 ```
+
+### CALVIN 配置
+
+```python
+RobotConfig(
+    robot_type = "calvin",
+    actual_action_dim = 7,        # delta [3 pos, 3 euler, 1 gripper]
+    actual_proprio_dim = 15,      # robot_obs 15D: [TCP(3), euler(3), grip_width(1), joints(7), grip_action(1)]
+    continuous_proprio_dim = 6,   # VLM tokenizer 用的连续 proprio 维度 (dims 0-5: TCP + euler)
+    gripper_dim_index = 6,        # grip_width (meters, 0~0.08)
+    gripper_threshold = 0.04,     # grip_width > 0.04m → open
+    action_dim_indices = [0,1,2,3,4,5,6],
+    state_obs_keys = ["state"],
+    camera_views = ["primary", "wrist"],
+    camera_rlds_keys = {"primary": "rgb_static", "wrist": "rgb_gripper"},
+    camera_model_keys = {"primary": "base_0_rgb", "wrist": "left_wrist_0_rgb"},
+    normalize_gripper = normalize_gripper_calvin,
+    # Gripper dim (index 6) NOT normalized — stays in [0,1] after gripper transform
+    action_norm_mask = [True]*6 + [False],
+)
+```
+
+**CALVIN vs LIBERO Gripper 语义差异:**
+
+| 阶段 | LIBERO | CALVIN |
+|------|--------|--------|
+| 原始 action[-1] 语义 | -1=open, +1=close | -1=close, +1=open |
+| `normalize_gripper()` | `clip(0,1)` 然后 `1-x` (反转) | `clip(0,1)` (无反转) |
+| 训练后 model output | [0,1], 0=close, 1=open | [0,1], 0=close, 1=open |
+| Eval 后处理 | `x*2-1 → sign → negate` | `x*2-1 → sign` (无 negate) |
+| Env 期望 | -1=open, +1=close | +1=open, -1=close |
+
+**CALVIN State (robot_obs) 15D 结构:**
+
+| Dim | 描述 |
+|-----|------|
+| 0-2 | TCP position (x, y, z) |
+| 3-5 | TCP orientation (euler x, y, z) |
+| 6 | Gripper width (meters, 0~0.08) |
+| 7-13 | 7 joint angles (radians) |
+| 14 | Gripper action (-1/+1, +1=open) |
 
 ### R1 Lite 配置
 
@@ -1081,3 +1140,102 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 2. 检查日志中 `WaypointAEDataset` 和 `WaypointVLMDataset` 的 `episode_shuffle_buffer=500` 输出
 3. 观察 wandb loss 曲线是否比不 shuffle 时更平滑（无 suite 切换跳变）
 4. 对比实验：shuffle vs 不 shuffle 的最终 eval 成功率
+
+---
+
+## 十七、CALVIN ABC_D 支持 (rev 10)
+
+### 动机
+
+扩展 Waypoint VLA 到 CALVIN benchmark (ABC_D split)。CALVIN 使用与 LIBERO 相同的 Franka Panda 机器人，7D 动作 (EEF 6D + gripper)，但有不同的观测 key、gripper 语义和评测协议。
+
+### 与 LIBERO 的关键差异
+
+1. **Gripper 语义**: LIBERO 原始 action 中 -1=open, +1=close; CALVIN 中 +1=open, -1=close。这影响训练时的 `normalize_gripper` 和评测时的 post-processing。
+2. **观测 key**: LIBERO 用 `agentview_image` / `robot0_eye_in_hand_image`; CALVIN 用 `rgb_obs/rgb_static` / `rgb_obs/rgb_gripper`。
+3. **Proprio**: LIBERO 8D (EEF + gripper_qpos×2); CALVIN 15D (TCP + euler + grip_width + 7 joints + grip_action)。
+4. **评测协议**: LIBERO 是 per-task success rate; CALVIN 是 chain-task: 1000 sequences × 5 subtasks，报告 avg_seq_len 和 chain success rates (1/5 ~ 5/5)。
+5. **图像**: LIBERO 需要 `[::-1, ::-1]` 翻转; CALVIN 不需要翻转。
+6. **Center crop**: 评测时 CALVIN 与 LIBERO 一样支持 center crop (当训练时使用了 `RandomResizedCrop` 增强时启用)。
+
+### 修改/新建文件清单
+
+| 文件 | 类型 | 修改内容 |
+|------|------|----------|
+| `robot_config.py` | 修改 | 新增 `normalize_gripper_calvin()`; `CAMERA_KEY_MAPS`, `CAMERA_TO_MODEL_KEY`, `ROBOT_ACTION_DIM_CONFIGS`, `ROBOT_STATE_KEYS` 各增 `"calvin"` 条目; 新增 `make_calvin_config()`; `get_robot_config()` 注册 `"calvin"` |
+| `eval_calvin.py` | 新建 | CALVIN 评测脚本: `get_proprio_from_obs_calvin()`, `get_calvin_images()`, `run_calvin_subtask()`, `evaluate_sequence()`, `evaluate()`, chain-task metrics |
+| `waypoint_joint_calvin.yaml` | 新建 | CALVIN 联合训练配置 |
+| `eval_waypoint_joint_calvin.yaml` | 新建 | CALVIN 评测配置 |
+
+### 无需修改的文件
+
+以下文件已通过 `RobotConfig` 参数化，自动适配 CALVIN:
+- `ae_dataset.py` — 通过 `state_obs_keys=["state"]` + `rc.split_proprio()` + `rc.normalize_gripper()`
+- `vlm_dataset.py` — 同上
+- `tokenizer.py` — 通过 `proprio_dim` 参数化
+- `normalize.py` — 通用
+- `joint_model.py`, `ae_model.py`, `vlm_model.py` — 模型架构不变
+- `train_waypoint_joint.py`, `train_waypoint.py` — 通过 `get_robot_config(cfg["robot_type"])` 获取配置
+- `compute_wp_norm_stats.py` — 已支持 `--robot_type`，无需修改
+
+### CALVIN 评测管线 (`eval_calvin.py`)
+
+```
+for seq_i in 1..1000:
+    initial_state, [subtask_1, ..., subtask_5] = get_sequences()
+    env.reset(robot_obs, scene_obs)
+    for subtask in subtasks:
+        success = run_calvin_subtask(env, vlm, ae, subtask, ep_len=360)
+        if not success: break
+    results.append(num_consecutive_successes)
+
+report: avg_seq_len, chain_sr[1/5 .. 5/5]
+```
+
+**`run_calvin_subtask()` 关键逻辑:**
+1. 从 CALVIN env 获取 `obs["robot_obs"]` (15D) 和 `obs["rgb_obs"]` (static + gripper)
+2. `rc.split_proprio()` 拆分 15D → 6D continuous + binary gripper
+3. VLM 预测 waypoints → AE 填充动作 → 执行
+4. Gripper post-processing: `x*2-1 → sign` (**不 negate**，因 CALVIN env 期望 +1=open)
+5. 每步通过 `task_oracle.get_task_info_for_set()` 检查任务完成
+
+**Center crop 支持:**
+- `get_calvin_images()` 接受 `center_crop_scale` 参数
+- 当配置中 `center_crop: true` 时，对 static 和 gripper 图像应用 `center_crop_and_resize()`
+- 默认配置 `center_crop_scale: 0.9`，与训练时的 `RandomResizedCrop(scale=[0.9, 1.0])` 匹配
+
+**依赖:** `calvin_env`, `calvin_agent`, `hydra`, `omegaconf`
+
+### 训练命令
+
+```bash
+cd /workspace/openpi
+
+# 1. 生成归一化统计量
+.venv/bin/python scripts/compute_wp_norm_stats.py \
+  --rlds_dir /workspace/calvin_abc_wp_001/calvin_abc_wp/1.0.0 \
+  --robot_type calvin \
+  --output_dir /workspace/calvin_abc_wp_001/norm_stats
+
+# 2. 联合训练
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+.venv/bin/torchrun --standalone --nnodes=1 --nproc_per_node=2 \
+    scripts/train_waypoint_joint.py \
+    --config configs/waypoint_joint_calvin.yaml
+```
+
+### 评测命令
+
+```bash
+CALVIN_ROOT=/path/to/calvin \
+PYTHONPATH=$PWD:$PYTHONPATH \
+.venv/bin/python -u -m openpi.waypoint.eval_calvin \
+    --config configs/eval_waypoint_joint_calvin.yaml
+```
+
+### 验证清单
+
+1. **Norm stats**: 运行 `compute_wp_norm_stats.py --robot_type calvin` — 确认 7D action stats 和 6D proprio stats
+2. **训练冒烟测试**: 运行 1 步联合训练确认无报错
+3. **评测冒烟测试**: 运行少量 sequences 确认 pipeline 端到端工作
+4. **完整训练 + 评测**: 训练 5000 步，使用 chain-task 协议评测

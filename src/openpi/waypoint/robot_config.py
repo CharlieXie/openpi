@@ -27,6 +27,19 @@ def normalize_gripper_libero(actions: np.ndarray) -> np.ndarray:
     return actions
 
 
+def normalize_gripper_calvin(actions: np.ndarray) -> np.ndarray:
+    """CALVIN gripper: raw [-1,+1] (+1=open, -1=close) -> clip [0,1].
+
+    Result: 0=close, 1=open (matches flow matching convention).
+    No inversion needed — CALVIN's +1=open already aligns with convention.
+    """
+    actions = actions.copy()
+    gripper = actions[:, -1]
+    gripper = np.clip(gripper, 0, 1)
+    actions[:, -1] = gripper
+    return actions
+
+
 def normalize_gripper_r1_lite(actions: np.ndarray) -> np.ndarray:
     """R1 Lite gripper: raw [0,100] -> [0,1] for both arms."""
     QPOS_DIM = 6
@@ -50,6 +63,10 @@ CAMERA_KEY_MAPS: dict[str, dict[str, str]] = {
         "primary": "image",
         "wrist": "wrist_image",
     },
+    "calvin": {
+        "primary": "rgb_static",
+        "wrist": "rgb_gripper",
+    },
 }
 
 # Mapping from RLDS camera names to openpi model image keys
@@ -60,6 +77,10 @@ CAMERA_TO_MODEL_KEY: dict[str, dict[str, str]] = {
         "wrist_right": "right_wrist_0_rgb",
     },
     "libero": {
+        "primary": "base_0_rgb",
+        "wrist": "left_wrist_0_rgb",
+    },
+    "calvin": {
         "primary": "base_0_rgb",
         "wrist": "left_wrist_0_rgb",
     },
@@ -80,6 +101,9 @@ ROBOT_ACTION_DIM_CONFIGS: dict[str, dict[str, list[int]]] = {
     "libero": {
         "with_arm": list(range(0, 7)),
     },
+    "calvin": {
+        "with_arm": list(range(0, 7)),
+    },
 }
 
 # State observation keys in RLDS
@@ -91,6 +115,9 @@ ROBOT_STATE_KEYS: dict[str, dict[str, list[str]]] = {
         "with_chassis": ["base_velocity"],
     },
     "libero": {
+        "with_arm": ["state"],
+    },
+    "calvin": {
         "with_arm": ["state"],
     },
 }
@@ -186,6 +213,27 @@ def make_libero_config() -> RobotConfig:
     )
 
 
+def make_calvin_config() -> RobotConfig:
+    action_dims = list(range(7))
+    # Gripper (dim 6) is already in [0,1] after normalize_gripper_calvin → skip normalization
+    norm_mask = np.array([True] * 6 + [False], dtype=bool)
+    return RobotConfig(
+        robot_type="calvin",
+        actual_action_dim=7,
+        actual_proprio_dim=15,  # CALVIN robot_obs is 15D
+        continuous_proprio_dim=6,  # dims 0-5 (TCP pos + euler)
+        gripper_dim_index=6,  # gripper width (meters, 0~0.08)
+        gripper_threshold=0.04,  # > 0.04m → open
+        action_dim_indices=action_dims,
+        state_obs_keys=["state"],
+        camera_views=["primary", "wrist"],
+        camera_rlds_keys=CAMERA_KEY_MAPS["calvin"],
+        camera_model_keys=CAMERA_TO_MODEL_KEY["calvin"],
+        normalize_gripper=normalize_gripper_calvin,
+        action_norm_mask=norm_mask,
+    )
+
+
 def make_r1_lite_config(
     with_left_arm: bool = True,
     with_right_arm: bool = True,
@@ -230,6 +278,8 @@ def get_robot_config(robot_type: str, **kwargs) -> RobotConfig:
     """Factory function to get a robot configuration."""
     if robot_type == "libero":
         return make_libero_config()
+    elif robot_type == "calvin":
+        return make_calvin_config()
     elif robot_type == "galaxea_r1_lite":
         return make_r1_lite_config(**kwargs)
     else:
