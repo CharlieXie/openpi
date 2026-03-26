@@ -25,6 +25,7 @@ from openpi.waypoint.normalize import (
     pad_to_dim,
 )
 from openpi.waypoint.robot_config import RobotConfig
+from openpi.waypoint.vlm_dataset import build_image_augmentation
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,8 @@ class WaypointAEDataset(IterableDataset):
         shuffle_buffer_size: int = 10000,
         image_size: tuple[int, int] = (224, 224),
         episode_shuffle_buffer: int = 0,
+        image_aug: bool = False,
+        image_aug_cfg: dict | None = None,
     ):
         super().__init__()
         self.original_rlds_dir = original_rlds_dir
@@ -67,6 +70,11 @@ class WaypointAEDataset(IterableDataset):
         self.episode_shuffle_buffer = episode_shuffle_buffer
 
         self.norm_helper = NormalizationHelper(dataset_statistics, norm_type)
+
+        self.image_aug_transform = None
+        if image_aug:
+            self.image_aug_transform = build_image_augmentation(image_aug_cfg)
+            logger.info(f"AE image augmentation enabled: {self.image_aug_transform}")
 
         # Override action_norm_mask from robot_config if provided (e.g. gripper not normalized)
         if robot_config.action_norm_mask is not None:
@@ -131,6 +139,8 @@ class WaypointAEDataset(IterableDataset):
                 img = Image.fromarray(img_data)
                 if img.size != self.image_size:
                     img = img.resize(self.image_size, Image.BILINEAR)
+                if self.image_aug_transform is not None:
+                    img = self.image_aug_transform(img)
                 images[model_key] = np.array(img, dtype=np.uint8)
 
             start_proprio_raw = extract_proprio_from_obs(

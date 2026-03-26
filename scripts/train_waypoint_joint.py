@@ -89,6 +89,8 @@ def train_joint(cfg, device, use_ddp, is_main):
         model_proprio_dim=cfg.get("model_proprio_dim", 32),
         shuffle_buffer_size=cfg.get("ae_shuffle_buffer_size", 1000),
         episode_shuffle_buffer=cfg.get("episode_shuffle_buffer_size", 0),
+        image_aug=cfg.get("image_aug", False),
+        image_aug_cfg=cfg.get("image_aug_cfg", None),
     )
     ae_collator = WaypointAECollator()
     ae_loader = torch.utils.data.DataLoader(
@@ -112,7 +114,6 @@ def train_joint(cfg, device, use_ddp, is_main):
         vlm_max_token_len=cfg.get("vlm_max_token_len", 256),
         gradient_strategy=cfg.get("gradient_strategy", "none"),
         gradient_scale=cfg.get("gradient_scale", 0.1),
-        aug_cfg=cfg.get("ae_image_aug_cfg", None) if cfg.get("ae_image_aug", False) else None,
     ).to(device)
     model.gradient_checkpointing_enable()
     if is_main:
