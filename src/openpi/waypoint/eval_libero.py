@@ -695,11 +695,16 @@ def evaluate(cfg):
     num_tasks = bm.n_tasks
     num_trials = cfg.get("num_trials_per_task", 3)
 
+    task_start = cfg.get("task_start", 0)
+    task_end = cfg.get("task_end", num_tasks)
+    task_end = min(task_end, num_tasks)
+    logger.info(f"Evaluating tasks [{task_start}, {task_end}) out of {num_tasks} total")
+
     results = {}
     total_success = 0
     total_episodes = 0
 
-    for task_idx in range(num_tasks):
+    for task_idx in range(task_start, task_end):
         task = bm.get_task(task_idx)
         task_name = task.name
         task_desc = task.language
@@ -714,7 +719,7 @@ def evaluate(cfg):
         from libero.libero.envs import OffScreenRenderEnv
         t0 = time.time()
         env = OffScreenRenderEnv(**env_args)
-        env.seed(0)
+        env.seed(7)
         logger.info(f"Env init for task {task_idx}: {time.time() - t0:.1f}s")
 
         successes = 0
@@ -738,7 +743,7 @@ def evaluate(cfg):
                 imageio.mimwrite(
                     str(video_file),
                     [np.asarray(x) for x in replay_images],
-                    fps=10,
+                    fps=20,
                 )
                 logger.info(f"  -> {suffix.upper()} ({ep_secs:.1f}s, video: {video_file})")
             else:
@@ -773,12 +778,25 @@ def main():
     logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--task-start", type=int, default=None, help="First task index (inclusive)")
+    parser.add_argument("--task-end", type=int, default=None, help="Last task index (exclusive)")
+    parser.add_argument("--results-file", type=str, default=None, help="Save results to JSON file")
     args = parser.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    evaluate(cfg)
+    if args.task_start is not None:
+        cfg["task_start"] = args.task_start
+    if args.task_end is not None:
+        cfg["task_end"] = args.task_end
+
+    results = evaluate(cfg)
+
+    if args.results_file:
+        with open(args.results_file, "w") as f:
+            json.dump(results, f, indent=2)
+        logger.info(f"Results saved to {args.results_file}")
 
 
 if __name__ == "__main__":

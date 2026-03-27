@@ -361,7 +361,7 @@ def evaluate_sequence(
                 imageio.mimwrite(
                     video_file,
                     [np.asarray(x) for x in replay_images],
-                    fps=10,
+                    fps=20,
                 )
             except Exception as e:
                 logger.warning(f"Failed to save video: {e}")

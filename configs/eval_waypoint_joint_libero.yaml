@@ -5,14 +5,14 @@
 # Saves ~50% VRAM compared to loading two separate models.
 
 robot_type: libero
-task_suite: libero_spatial
+task_suite: libero_10
 
 # Joint model checkpoint (single checkpoint with shared backbone)
 # When "joint_checkpoint" is present, eval_libero auto-detects joint mode.
-joint_checkpoint: /workspace/model/1200
+joint_checkpoint: /projects/chuanlia001ssd/repos/pi_train/checkpoints/waypoint_joint_libero_10_sg_0.1_t2/900
 
 # Data / normalization
-dataset_statistics_path: /workspace/data/dataset_statistics.json
+dataset_statistics_path: /projects/chuanlia001ssd/data/libero/10/dataset_statistics.json
 
 # Model dimensions
 model_action_dim: 32
@@ -41,8 +41,8 @@ center_crop: true
 center_crop_scale: 0.9
 
 # Evaluation
-num_trials_per_task: 50
+num_trials_per_task: 3
 num_steps_wait: 10
 
 # Video output
-video_out_path: data/libero/videos_wp_joint_spatial_full
+video_out_path: data/libero/videos_wp_joint_10_sg0.1_s900
