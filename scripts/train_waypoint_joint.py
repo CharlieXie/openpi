@@ -14,6 +14,8 @@ import argparse
 import contextlib
 import logging
 import os
+import queue
+import threading
 import time
 from pathlib import Path
 
@@ -36,6 +38,44 @@ from train_waypoint import (
     save_checkpoint,
     setup_ddp,
 )
+
+
+class _PrefetchIter:
+    """Background-thread prefetcher for a DataLoader.
+
+    While the main thread runs GPU forward/backward, a daemon thread
+    pre-loads the next batch via the DataLoader iterator, hiding most
+    of the CPU data-loading latency behind GPU compute.
+    """
+
+    def __init__(self, loader, prefetch_count=2):
+        self._loader = loader
+        self._queue: queue.Queue = queue.Queue(maxsize=prefetch_count)
+        self._stop = threading.Event()
+        self._exception: BaseException | None = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        it = iter(self._loader)
+        while not self._stop.is_set():
+            try:
+                batch = next(it)
+            except StopIteration:
+                it = iter(self._loader)
+                batch = next(it)
+            except Exception as exc:
+                self._exception = exc
+                return
+            self._queue.put(batch)
+
+    def __next__(self):
+        if self._exception is not None:
+            raise self._exception
+        return self._queue.get()
+
+    def stop(self):
+        self._stop.set()
 
 
 def train_joint(cfg, device, use_ddp, is_main):
@@ -217,8 +257,15 @@ def train_joint(cfg, device, use_ddp, is_main):
             self.token_ar_mask = None
             self.token_loss_mask = None
 
-    vlm_iter = iter(vlm_loader)
-    ae_iter = iter(ae_loader)
+    use_prefetch = cfg.get("prefetch", True)
+    if use_prefetch:
+        vlm_iter = _PrefetchIter(vlm_loader, prefetch_count=2)
+        ae_iter = _PrefetchIter(ae_loader, prefetch_count=2)
+        if is_main:
+            logging.info("Data prefetching enabled (threaded, prefetch_count=2)")
+    else:
+        vlm_iter = iter(vlm_loader)
+        ae_iter = iter(ae_loader)
 
     for global_step in range(global_step, num_steps):
         # LR update
@@ -226,17 +273,20 @@ def train_joint(cfg, device, use_ddp, is_main):
             pg["lr"] = cosine_lr(global_step, warmup, peak_lr, decay_steps, end_lr)
 
         # --- Get batches ---
-        try:
+        if use_prefetch:
             vlm_batch = next(vlm_iter)
-        except StopIteration:
-            vlm_iter = iter(vlm_loader)
-            vlm_batch = next(vlm_iter)
-
-        try:
             ae_batch = next(ae_iter)
-        except StopIteration:
-            ae_iter = iter(ae_loader)
-            ae_batch = next(ae_iter)
+        else:
+            try:
+                vlm_batch = next(vlm_iter)
+            except StopIteration:
+                vlm_iter = iter(vlm_loader)
+                vlm_batch = next(vlm_iter)
+            try:
+                ae_batch = next(ae_iter)
+            except StopIteration:
+                ae_iter = iter(ae_loader)
+                ae_batch = next(ae_iter)
 
         # Move VLM batch to device
         vlm_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in vlm_batch.items()}
@@ -322,6 +372,9 @@ def train_joint(cfg, device, use_ddp, is_main):
 
     if pbar:
         pbar.close()
+    if use_prefetch:
+        vlm_iter.stop()
+        ae_iter.stop()
     wandb.finish()
 
 

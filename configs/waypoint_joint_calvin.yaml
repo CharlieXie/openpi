@@ -10,7 +10,7 @@ wp_indices_path: /workspace/data/calvin_abc_wp_0_02/waypoint_indices.json
 # VLM data
 wp_rlds_dir: /workspace/data/calvin_abc_wp_0_02/calvin_abc_wp/1.0.0
 # Shared
-dataset_statistics_path: /workspace/data/calvin_abc_rlds/dataset_statistics.json
+dataset_statistics_path: /workspace/data/dataset_statistics.json
 
 # --- Model architecture ---
 paligemma_variant: gemma_2b
@@ -30,7 +30,7 @@ vlm_max_token_len: 256
 stride: 1
 
 # Pretrained weights (Pi0.5 base)
-pretrained_weight_path: /workspace/models
+pretrained_weight_path: /workspace/models/600
 
 # --- Joint training ---
 gradient_strategy: scale_gradient       # "none" | "stop_gradient" | "scale_gradient" | "freeze_backbone"

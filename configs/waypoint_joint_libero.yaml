@@ -30,7 +30,7 @@ vlm_max_token_len: 256
 stride: 1
 
 # Pretrained weights (Pi0.5 base)
-pretrained_weight_path: /projects/chuanlia001ssd/models/pi05_base_pytorch
+pretrained_weight_path: /workspace/models/600
 
 # --- Joint training ---
 gradient_strategy: scale_gradient       # "none" | "stop_gradient" | "scale_gradient" | "freeze_backbone"
