@@ -5,12 +5,12 @@ robot_type: libero
 
 # --- Data paths ---
 # AE data
-original_rlds_dir: /projects/chuanlia001ssd/data/libero/10/libero_10_no_noops/1.0.0
-wp_indices_path: /projects/chuanlia001ssd/data/libero/10/libero_10_wp_001/waypoint_indices.json
+original_rlds_dir: /workspace/data/libero_10_no_noops/1.0.0
+wp_indices_path: /workspace/data/libero_10_wp_0006/waypoint_indices.json
 # VLM data
-wp_rlds_dir: /projects/chuanlia001ssd/data/libero/10/libero_10_wp_001/waypoint_filtered_rlds__libero/1.0.0
+wp_rlds_dir: /workspace/data/libero_10_wp_0006/waypoint_filtered_rlds__libero/1.0.0
 # Shared
-dataset_statistics_path: /projects/chuanlia001ssd/data/libero/10/dataset_statistics.json
+dataset_statistics_path: /workspace/openpi/data/dataset_statistics.json
 
 # --- Model architecture ---
 paligemma_variant: gemma_2b
@@ -30,21 +30,21 @@ vlm_max_token_len: 256
 stride: 1
 
 # Pretrained weights (Pi0.5 base)
-pretrained_weight_path: /projects/chuanlia001ssd/repos/pi_train/checkpoints/waypoint_joint_libero_10_sg_0.1/1000
+pretrained_weight_path: /workspace/model/1000
 
 # --- Joint training ---
 gradient_strategy: scale_gradient       # "none" | "stop_gradient" | "scale_gradient" | "freeze_backbone"
-gradient_scale: 0.1                     # only used when gradient_strategy=scale_gradient (fraction of AE gradient flowing into backbone K/V)
+gradient_scale: 0.3                     # only used when gradient_strategy=scale_gradient (fraction of AE gradient flowing into backbone K/V)
 ae_loss_weight: 1.0
 
 # Batch sizes (per GPU)
-vlm_batch_size: 192
-ae_batch_size: 192
+vlm_batch_size: 256
+ae_batch_size: 256
 
 # Training hyperparameters
 num_train_steps: 1000
 warmup_steps: 40
-peak_lr: 5.0e-5
+peak_lr: 1.5e-4
 end_lr: 1.0e-7
 
 # Normalization
@@ -66,23 +66,23 @@ vlm_shuffle_buffer_size: 5000
 ae_shuffle_buffer_size: 1000
 
 # Logging and checkpointing
-exp_name: waypoint_joint_libero_10_sg_0.1_t2
+exp_name: waypoint_joint_libero_10_lora_sg_0.3
 checkpoint_dir: checkpoints/{exp_name}
 save_interval: 100
-log_interval: 3
+log_interval: 4
 wandb_enabled: true
 wandb_project: waypoint_e2e
 
 # LoRA (set to true for parameter-efficient fine-tuning)
-lora_enabled: false
+lora_enabled: true
 lora_rank: 16
 lora_alpha: 16.0
-# lora_init: true              # true/"kaiming" (default) or "gaussian"
-# lora_dropout: 0.0
+lora_init: "gaussian"              # true/"kaiming" (default) or "gaussian"
+lora_dropout: 0.0
 # lora_use_rslora: false
-# lora_apply_to: all           # "all" | "backbone_only" | "expert_only"
-# vision_encoder_mode: freeze  # "freeze" (default) | "lora" | "full"
-train_vision_encoder: true      # (legacy) maps to vision_encoder_mode if not set
+lora_apply_to: all           # "all" | "backbone_only" | "expert_only"
+vision_encoder_mode: lora  # "freeze" (default) | "lora" | "full"
+# train_vision_encoder: true      # (legacy) maps to vision_encoder_mode if not set
 
 # LoRA skip-list: these modules are NOT wrapped with LoRA.
 # They are either full-trained or frozen, controlled by lora_trainable_modules.
