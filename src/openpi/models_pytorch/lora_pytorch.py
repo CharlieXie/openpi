@@ -211,14 +211,18 @@ class LoRAEmbedding(nn.Module):
         directly for logits via ``F.linear(h, weight)``, bypassing any
         separate lm_head module.
         """
-        # Cast weights to match hidden dtype (caller may pass float32
-        # while weights are bfloat16).
-        dtype = hidden.dtype
-        base = F.linear(hidden, self.base_layer.weight.to(dtype))
+        # Cast hidden to weight dtype (bf16) instead of casting the large
+        # weight (257152×2048) to float32 — avoids a ~2 GB temporary copy
+        # that would be held alive by the autograd graph until backward.
+        # Logits precision is fine in bf16; cross-entropy handles fp32 internally.
+        out_dtype = hidden.dtype
+        w_dtype = self.base_layer.weight.dtype
+        h = hidden.to(w_dtype) if hidden.dtype != w_dtype else hidden
+        base = F.linear(h, self.base_layer.weight)
         # LoRA correction: hidden @ B^T @ A^T * scaling
-        intermediate = F.linear(hidden, self.lora_embedding_B.to(dtype))    # (..., rank)
-        lora = F.linear(intermediate, self.lora_embedding_A.to(dtype))      # (..., vocab)
-        return base + lora * self.scaling
+        intermediate = F.linear(h, self.lora_embedding_B)    # (..., rank)
+        lora = F.linear(intermediate, self.lora_embedding_A)      # (..., vocab)
+        return (base + lora * self.scaling).to(out_dtype)
 
     # -- merge for inference -----------------------------------------------
     def merge(self) -> None:

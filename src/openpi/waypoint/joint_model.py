@@ -139,7 +139,12 @@ class PI0WaypointJoint(nn.Module):
         embed_layer = self.paligemma_with_expert.paligemma.language_model.embed_tokens
         if hasattr(embed_layer, "compute_logits"):
             return embed_layer.compute_logits(hidden)
-        return F.linear(hidden, embed_layer.weight.to(hidden.dtype))
+        # Cast hidden to weight dtype to avoid creating a large float32
+        # copy of the embedding weight (~2 GB) in the autograd graph.
+        w = embed_layer.weight
+        out_dtype = hidden.dtype
+        h = hidden.to(w.dtype) if hidden.dtype != w.dtype else hidden
+        return F.linear(h, w).to(out_dtype)
 
     # ------------------------------------------------------------------
     # DDP-compatible forward dispatcher
