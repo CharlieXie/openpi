@@ -86,7 +86,9 @@ vision_encoder_mode: lora  # "freeze" (default) | "lora" | "full"
 
 # LoRA skip-list: these nn.Linear modules are NOT wrapped with LoRA.
 # They are either full-trained or frozen, controlled by lora_trainable_modules.
-# NOTE: embed_tokens (nn.Embedding) gets LoRA via LoRAEmbedding automatically.
+# By default, embed_tokens (nn.Embedding) gets LoRA via LoRAEmbedding.
+# To disable embed_tokens LoRA (full-train instead), add "embed_tokens" to both
+# lora_modules_to_skip and lora_trainable_modules below (+4.2GB optimizer memory).
 # (Uncomment to override defaults — most users don't need to change these)
 # lora_modules_to_skip:
 #   - action_in_proj
@@ -96,6 +98,7 @@ vision_encoder_mode: lora  # "freeze" (default) | "lora" | "full"
 #   - time_mlp_out
 #   - multi_modal_projector
 #   - lm_head                   # tied with embed_tokens, logits via LoRAEmbedding
+#   # - embed_tokens            # uncomment to disable LoRAEmbedding → full-train
 
 # LoRA trainable list: among skipped modules, which ones stay trainable?
 # Modules in skip-list but NOT here → frozen.
@@ -107,6 +110,7 @@ vision_encoder_mode: lora  # "freeze" (default) | "lora" | "full"
 #   - time_mlp_in
 #   - time_mlp_out
 #   - multi_modal_projector
+#   # - embed_tokens            # uncomment if embed_tokens is in skip-list above
 
 # Resume from checkpoint
 resume: false

@@ -139,7 +139,7 @@ class PI0WaypointJoint(nn.Module):
         embed_layer = self.paligemma_with_expert.paligemma.language_model.embed_tokens
         if hasattr(embed_layer, "compute_logits"):
             return embed_layer.compute_logits(hidden)
-        return F.linear(hidden, embed_layer.weight)
+        return F.linear(hidden, embed_layer.weight.to(hidden.dtype))
 
     # ------------------------------------------------------------------
     # DDP-compatible forward dispatcher
