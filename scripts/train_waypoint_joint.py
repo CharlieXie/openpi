@@ -168,19 +168,28 @@ def train_joint(cfg, device, use_ddp, is_main):
             log_gpu_memory(device, prefix="[After weight load] ")
 
     # --- LoRA ---
-    if cfg.get("lora_enabled", False):
+    lora_enabled = cfg.get("lora_enabled", False)
+    lora_cfg = None
+    if lora_enabled:
         import openpi.models_pytorch.lora_pytorch as lora_utils
+
+        # Map vision_encoder config: old train_vision_encoder bool -> new mode
+        vision_mode = cfg.get("vision_encoder_mode", None)
+        if vision_mode is None:
+            vision_mode = "full" if cfg.get("train_vision_encoder", False) else "freeze"
+
         lora_cfg = lora_utils.LoRATrainingConfig(
             enabled=True,
-            attn_rank=cfg.get("lora_rank", 16),
-            ffn_rank=cfg.get("lora_rank", 16),
-            attn_alpha=cfg.get("lora_alpha", 16.0),
-            ffn_alpha=cfg.get("lora_alpha", 16.0),
-            apply_to="all",
-            train_non_lora_layers=True,
-            train_vision_encoder=cfg.get("train_vision_encoder", True),
+            rank=cfg.get("lora_rank", 16),
+            alpha=cfg.get("lora_alpha", 16.0),
+            dropout=cfg.get("lora_dropout", 0.0),
+            use_rslora=cfg.get("lora_use_rslora", False),
+            init_lora_weights=cfg.get("lora_init", True),  # True/"kaiming" or "gaussian"
+            vision_encoder_mode=vision_mode,
+            apply_to=cfg.get("lora_apply_to", "all"),
         )
-        frozen, trainable = lora_utils.apply_lora_to_pi0_pytorch(model, lora_cfg)
+        frozen, trainable = lora_utils.apply_lora_to_model(model, lora_cfg)
+        lora_utils.print_lora_summary(model)
         logging.info(f"LoRA applied: {trainable:,} trainable, {frozen:,} frozen")
 
     # --- DDP ---
@@ -362,6 +371,11 @@ def train_joint(cfg, device, use_ddp, is_main):
 
         step_for_save = global_step + 1
         save_checkpoint(model, optimizer, step_for_save, save_dir, is_main, save_interval)
+        # Save LoRA-only checkpoint alongside full checkpoint
+        if lora_enabled and is_main and step_for_save % save_interval == 0:
+            import openpi.models_pytorch.lora_pytorch as lora_utils
+            lora_path = save_dir / f"{step_for_save}" / "lora.safetensors"
+            lora_utils.save_lora_checkpoint(model, str(lora_path))
         if pbar:
             pbar.update(1)
             pbar.set_postfix(

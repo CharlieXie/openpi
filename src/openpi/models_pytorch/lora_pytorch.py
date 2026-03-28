@@ -1,442 +1,529 @@
-"""PyTorch LoRA implementation for pi0.5 training."""
+"""PEFT-style LoRA for Waypoint Joint Model (PI0WaypointJoint).
+
+Key design choices (following HuggingFace PEFT):
+  - **Wrapper pattern**: LoRALinear wraps the original nn.Linear as
+    ``self.base_layer`` — zero-copy, no ``.clone()`` of weights.
+  - **Default-all + skip-list**: every nn.Linear gets LoRA unless its
+    full path matches an entry in ``modules_to_not_lora``.
+  - **LoRA-only save/load**: ``get_lora_state_dict`` / ``load_lora_state_dict``
+    only touch trainable parameters (LoRA A/B + whitelisted non-LoRA modules).
+  - **DDP-friendly**: frozen base weights don't participate in gradient sync;
+    only LoRA + trainable-module params are synced.
+"""
+
+from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
-from dataclasses import field
+from dataclasses import dataclass, field
 from typing import Literal
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from safetensors.torch import save_file as safetensors_save
 
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# LoRA config
+# ---------------------------------------------------------------------------
 
 @dataclass
 class LoRAConfig:
-    """Configuration for LoRA adapters."""
+    """Per-layer LoRA hyper-parameters."""
 
-    # LoRA rank - lower rank = fewer parameters but less capacity
-    rank: int
-    # LoRA scaling factor: output = base_output + lora_output * (alpha / rank)
-    alpha: float = 1.0
-    # Enable rank-stabilized LoRA (rsLoRA): uses alpha / sqrt(rank) instead
-    # Reference: https://arxiv.org/pdf/2312.03732
-    rslora: bool = False
-    # Dropout rate for LoRA layers (applied to input before LoRA projection)
+    rank: int = 16
+    alpha: float = 16.0
     dropout: float = 0.0
-    # Initialization standard deviation for LoRA A matrix
-    init_std: float = 0.01
+    # rsLoRA: scale by alpha/sqrt(rank) instead of alpha/rank
+    use_rslora: bool = False
+    # Initialisation for lora_A.
+    #   True / "kaiming" → kaiming_uniform (PEFT / LoRA paper default)
+    #   "gaussian"       → normal(0, 1/rank)  (PEFT gaussian option)
+    init_lora_weights: bool | str = True
 
     @property
-    def scaling_value(self) -> float:
-        """Get the scaling value based on whether rsLoRA is enabled."""
-        return self.alpha / math.sqrt(self.rank) if self.rslora else self.alpha / self.rank
+    def scaling(self) -> float:
+        if self.use_rslora:
+            return self.alpha / math.sqrt(self.rank)
+        return self.alpha / self.rank
+
+
+# ---------------------------------------------------------------------------
+# LoRALinear — PEFT-style wrapper (zero-copy)
+# ---------------------------------------------------------------------------
+
+class LoRALinear(nn.Module):
+    """Wraps an existing ``nn.Linear`` with LoRA adapters.
+
+    The original layer is stored as ``self.base_layer`` **by reference** —
+    no ``.clone()`` or memory duplication.  During forward the output is::
+
+        y = base_layer(x) + lora_B(lora_A(dropout(x))) * scaling
+    """
+
+    def __init__(self, base_layer: nn.Linear, config: LoRAConfig):
+        super().__init__()
+        # Store original layer — zero copy
+        self.base_layer = base_layer
+        self.config = config
+        in_features = base_layer.in_features
+        out_features = base_layer.out_features
+
+        # LoRA low-rank matrices
+        self.lora_A = nn.Linear(in_features, config.rank, bias=False)
+        self.lora_B = nn.Linear(config.rank, out_features, bias=False)
+        self.scaling = config.scaling
+
+        if config.dropout > 0:
+            self.lora_dropout = nn.Dropout(p=config.dropout)
+        else:
+            self.lora_dropout = nn.Identity()
+
+        # Initialise: B = zero (always), A depends on config
+        # This ensures the initial LoRA contribution is exactly 0.
+        nn.init.zeros_(self.lora_B.weight)
+        init = config.init_lora_weights
+        if init is True or (isinstance(init, str) and init.lower() == "kaiming"):
+            # PEFT / LoRA paper default: same as nn.Linear
+            nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        elif isinstance(init, str) and init.lower() == "gaussian":
+            # PEFT gaussian option: normal(0, 1/rank)
+            nn.init.normal_(self.lora_A.weight, std=1.0 / config.rank)
+        else:
+            raise ValueError(f"Unknown init_lora_weights={init!r}")
+
+        # Place LoRA params on same device / dtype as base
+        device = base_layer.weight.device
+        dtype = base_layer.weight.dtype
+        self.lora_A.to(device=device, dtype=dtype)
+        self.lora_B.to(device=device, dtype=dtype)
+
+    # -- forward --------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        result = self.base_layer(x)
+        # Cast input for LoRA branch if needed (e.g. fp32 input, bf16 LoRA)
+        lora_input = self.lora_dropout(x)
+        if lora_input.dtype != self.lora_A.weight.dtype:
+            lora_input = lora_input.to(self.lora_A.weight.dtype)
+        lora_out = self.lora_B(self.lora_A(lora_input))
+        return result + lora_out * self.scaling
+
+    # -- merge / unmerge for inference ----------------------------------
+    def merge(self) -> None:
+        """Merge LoRA weights into base layer (irreversible without saved delta)."""
+        with torch.no_grad():
+            delta = (self.lora_B.weight @ self.lora_A.weight) * self.scaling
+            self.base_layer.weight.data += delta.to(self.base_layer.weight.dtype)
+
+    def get_delta_weight(self) -> torch.Tensor:
+        """Return B @ A * scaling without modifying base."""
+        return (self.lora_B.weight @ self.lora_A.weight) * self.scaling
+
+    # -- convenience properties ----------------------------------------
+    @property
+    def in_features(self) -> int:
+        return self.base_layer.in_features
+
+    @property
+    def out_features(self) -> int:
+        return self.base_layer.out_features
+
+    @property
+    def weight(self) -> nn.Parameter:
+        return self.base_layer.weight
+
+    @property
+    def bias(self):
+        return self.base_layer.bias
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, "
+            f"bias={self.bias is not None}, "
+            f"lora_rank={self.config.rank}, lora_alpha={self.config.alpha}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Training-level config
+# ---------------------------------------------------------------------------
+
+# Default modules to NOT apply LoRA to (full-train or freeze instead).
+# Reasoning for each entry — see WAYPOINT_LORA_DESIGN.md.
+_DEFAULT_MODULES_TO_NOT_LORA: list[str] = [
+    # AE-specific projections: input dim too small (32) for LoRA to compress
+    "action_in_proj",
+    "action_out_proj",
+    "proprio_encoder",
+    # Time conditioning MLPs: new layers in joint model, must full-train
+    "time_mlp_in",
+    "time_mlp_out",
+    # Vision-language bridge: single small layer
+    "multi_modal_projector",
+    # embed_tokens is nn.Embedding (not nn.Linear) — won't be LoRA'd anyway,
+    # but listed here to also exclude from trainable_non_lora_modules.
+    "embed_tokens",
+    # lm_head (nn.Linear) is weight-tied with embed_tokens (same tensor).
+    # Joint model never calls lm_head.forward() — it uses embed_tokens.weight
+    # directly via F.linear(). LoRA on lm_head would:
+    #   (a) allocate dead params (forward never called → no gradients)
+    #   (b) break weight tying (state_dict key changes to .base_layer.weight)
+    # PEFT also explicitly excludes get_output_embeddings() for this reason.
+    "lm_head",
+]
+
+# Default modules among the skip-list that should remain trainable
+# (the rest are frozen).
+# NOTE: embed_tokens (527M) and lm_head are NOT here by default —
+#   they dominate trainable params (94%!) and defeat the purpose of
+#   LoRA.  Add them explicitly if you need to train new token
+#   embeddings (e.g. ``trainable_non_lora_modules += ["embed_tokens"]``).
+_DEFAULT_TRAINABLE_NON_LORA: list[str] = [
+    "action_in_proj",
+    "action_out_proj",
+    "proprio_encoder",
+    "time_mlp_in",
+    "time_mlp_out",
+    "multi_modal_projector",
+]
 
 
 @dataclass
 class LoRATrainingConfig:
-    """Training-specific LoRA configuration for PyTorch training."""
+    """Training-level LoRA configuration for the Waypoint Joint Model."""
 
-    # Whether to enable LoRA training
     enabled: bool = False
 
-    # LoRA rank for attention modules (q_proj, k_proj, v_proj, o_proj)
-    attn_rank: int = 16
-    # LoRA rank for FFN modules (gate_proj, up_proj, down_proj)
-    ffn_rank: int = 16
-
-    # LoRA alpha for attention modules
-    attn_alpha: float = 16.0
-    # LoRA alpha for FFN modules
-    ffn_alpha: float = 16.0
-
-    # Use rank-stabilized LoRA
-    use_rslora: bool = False
-    # Dropout rate for LoRA layers
+    # LoRA hyper-parameters (applied uniformly to all LoRA'd layers)
+    rank: int = 16
+    alpha: float = 16.0
     dropout: float = 0.0
+    use_rslora: bool = False
+    # Initialisation for lora_A: True/"kaiming" or "gaussian"
+    init_lora_weights: bool | str = True
 
-    # Which modules to apply LoRA to
-    target_modules: list[str] = field(default_factory=lambda: [
-        "q_proj", "k_proj", "v_proj", "o_proj",  # Attention
-        "gate_proj", "up_proj", "down_proj",      # FFN
-    ])
-
-    # Which parts of the model to apply LoRA to
-    apply_to: Literal["all", "paligemma_only", "expert_only", "paligemma_attn", "expert_attn"] = "all"
-
-    # Whether to train the vision encoder (SigLIP)
-    train_vision_encoder: bool = True
-
-    # Whether to also train non-LoRA layers (e.g., action projections, time MLPs)
-    train_non_lora_layers: bool = True
-    # Specific non-LoRA module names to train (if train_non_lora_layers is True)
-    trainable_modules: list[str] = field(default_factory=lambda: [
-        "action_in_proj", "action_out_proj",  # Action projections
-        "time_mlp_in", "time_mlp_out",        # Time embeddings (pi05)
-        "state_proj", "action_time_mlp_in", "action_time_mlp_out",  # pi0
-    ])
-
-    def get_attn_config(self) -> LoRAConfig:
-        """Get LoRA config for attention modules."""
-        return LoRAConfig(
-            rank=self.attn_rank,
-            alpha=self.attn_alpha,
-            rslora=self.use_rslora,
-            dropout=self.dropout,
-        )
-
-    def get_ffn_config(self) -> LoRAConfig:
-        """Get LoRA config for FFN modules."""
-        return LoRAConfig(
-            rank=self.ffn_rank,
-            alpha=self.ffn_alpha,
-            rslora=self.use_rslora,
-            dropout=self.dropout,
-        )
-
-    def get_lora_configs(self) -> dict[str, LoRAConfig]:
-        """Get a dictionary of LoRA configs for apply_lora_to_model."""
-        return {
-            "attn": self.get_attn_config(),
-            "ffn": self.get_ffn_config(),
-        }
-
-
-class LoRALinear(nn.Module):
-    """Linear layer with LoRA support."""
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        lora_config: LoRAConfig | None = None,
-        bias: bool = True,
-        device=None,
-        dtype=None,
-    ):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.lora_config = lora_config
-
-        # Original linear layer
-        self.weight = nn.Parameter(torch.empty(out_features, in_features, device=device, dtype=dtype))
-        if bias:
-            self.bias = nn.Parameter(torch.empty(out_features, device=device, dtype=dtype))
-        else:
-            self.register_parameter("bias", None)
-
-        # Initialize original weights
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        if self.bias is not None:
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
-            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            nn.init.uniform_(self.bias, -bound, bound)
-
-        # LoRA parameters
-        if lora_config is not None:
-            self.lora_a = nn.Parameter(
-                torch.empty(lora_config.rank, in_features, device=device, dtype=dtype)
-            )
-            self.lora_b = nn.Parameter(
-                torch.zeros(out_features, lora_config.rank, device=device, dtype=dtype)
-            )
-            # Initialize LoRA A with normal distribution
-            nn.init.normal_(self.lora_a, std=0.01)
-            # LoRA B is initialized to zeros (so initial LoRA contribution is 0)
-
-            if lora_config.dropout > 0:
-                self.lora_dropout = nn.Dropout(p=lora_config.dropout)
-            else:
-                self.lora_dropout = nn.Identity()
-        else:
-            self.register_parameter("lora_a", None)
-            self.register_parameter("lora_b", None)
-            self.lora_dropout = None
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Original linear transformation
-        result = F.linear(x, self.weight, self.bias)
-
-        # Add LoRA contribution if enabled
-        if self.lora_config is not None and self.lora_a is not None and self.lora_b is not None:
-            lora_input = self.lora_dropout(x)
-            # LoRA: x @ A.T @ B.T = x @ (B @ A).T
-            lora_out = F.linear(F.linear(lora_input, self.lora_a), self.lora_b)
-            result = result + lora_out * self.lora_config.scaling_value
-
-        return result
-
-    def merge_lora_weights(self):
-        """Merge LoRA weights into the original weights (for inference)."""
-        if self.lora_config is not None and self.lora_a is not None and self.lora_b is not None:
-            with torch.no_grad():
-                # W' = W + B @ A * scaling
-                self.weight.data += (self.lora_b @ self.lora_a) * self.lora_config.scaling_value
-            # Clear LoRA parameters
-            self.lora_a = None
-            self.lora_b = None
-            self.lora_config = None
-
-    def extra_repr(self) -> str:
-        lora_info = ""
-        if self.lora_config is not None:
-            lora_info = f", lora_rank={self.lora_config.rank}, lora_alpha={self.lora_config.alpha}"
-        return f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}{lora_info}"
-
-
-def apply_lora_to_linear(
-    linear: nn.Linear,
-    lora_config: LoRAConfig,
-) -> LoRALinear:
-    """Convert an existing nn.Linear layer to LoRALinear.
-
-    This preserves the original weights and adds LoRA parameters.
-    """
-    lora_linear = LoRALinear(
-        in_features=linear.in_features,
-        out_features=linear.out_features,
-        lora_config=lora_config,
-        bias=linear.bias is not None,
-        device=linear.weight.device,
-        dtype=linear.weight.dtype,
+    # Skip-list: full path substrings — any nn.Linear whose full
+    # ``named_modules()`` path contains one of these strings is **not**
+    # wrapped with LoRA.
+    modules_to_not_lora: list[str] = field(
+        default_factory=lambda: list(_DEFAULT_MODULES_TO_NOT_LORA),
     )
-    # Copy original weights
-    lora_linear.weight.data = linear.weight.data.clone()
-    if linear.bias is not None:
-        lora_linear.bias.data = linear.bias.data.clone()
 
-    return lora_linear
+    # Among skipped modules, which should remain trainable (the rest freeze).
+    trainable_non_lora_modules: list[str] = field(
+        default_factory=lambda: list(_DEFAULT_TRAINABLE_NON_LORA),
+    )
+
+    # Vision encoder (SigLIP) handling
+    vision_encoder_mode: Literal["freeze", "lora", "full"] = "freeze"
+
+    # Which sub-models to apply LoRA to
+    apply_to: Literal["all", "backbone_only", "expert_only"] = "all"
+
+    def get_lora_config(self) -> LoRAConfig:
+        return LoRAConfig(
+            rank=self.rank,
+            alpha=self.alpha,
+            dropout=self.dropout,
+            use_rslora=self.use_rslora,
+            init_lora_weights=self.init_lora_weights,
+        )
 
 
-def get_lora_config_from_variant(variant: str) -> dict[str, LoRAConfig] | None:
-    """Get LoRA config based on variant name.
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
-    Follows the JAX implementation convention where variant names with '_lora'
-    suffix indicate LoRA-enabled models.
-    """
-    if variant == "gemma_2b_lora":
-        return {
-            "attn": LoRAConfig(rank=16, alpha=16.0),
-            "ffn": LoRAConfig(rank=16, alpha=16.0),
-        }
-    if variant == "gemma_300m_lora":
-        return {
-            "attn": LoRAConfig(rank=32, alpha=32.0),
-            "ffn": LoRAConfig(rank=32, alpha=32.0),
-        }
-    return None
+def _get_parent_and_attr(model: nn.Module, dotted_name: str):
+    """Return (parent_module, attr_name) for a dotted module path."""
+    parts = dotted_name.rsplit(".", 1)
+    if len(parts) == 2:
+        return model.get_submodule(parts[0]), parts[1]
+    return model, dotted_name
 
+
+def _is_vision_tower(name: str) -> bool:
+    return "vision_tower" in name or "vision_model" in name
+
+
+def _should_skip_lora(name: str, config: LoRATrainingConfig) -> bool:
+    """Return True if this module path should NOT be wrapped with LoRA."""
+    # Check skip-list
+    for pattern in config.modules_to_not_lora:
+        if pattern in name:
+            return True
+
+    # Vision tower: skip unless vision_encoder_mode == "lora"
+    if _is_vision_tower(name) and config.vision_encoder_mode != "lora":
+        return True
+
+    # apply_to filter
+    if config.apply_to == "backbone_only":
+        if "gemma_expert" in name:
+            return True
+    elif config.apply_to == "expert_only":
+        if "paligemma" in name:
+            return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def apply_lora_to_model(
     model: nn.Module,
-    lora_configs: dict[str, LoRAConfig],
-    target_modules: list[str] | None = None,
-) -> None:
-    """Apply LoRA to specified modules in a model.
+    config: LoRATrainingConfig,
+) -> tuple[int, int]:
+    """Apply LoRA to a PI0WaypointJoint model.
 
-    Args:
-        model: The model to apply LoRA to.
-        lora_configs: Dictionary mapping module type ('attn' or 'ffn') to LoRAConfig.
-        target_modules: List of module names to apply LoRA to. If None, applies to all
-                       attention and FFN modules based on common naming patterns.
-    """
-    if target_modules is None:
-        # Default target modules for Gemma-style models
-        target_modules = [
-            "q_proj", "k_proj", "v_proj", "o_proj",  # Attention
-            "gate_proj", "up_proj", "down_proj",      # FFN (MLP)
-        ]
+    Every ``nn.Linear`` whose full path does **not** match any entry in
+    ``config.modules_to_not_lora`` (and passes the vision / apply_to
+    filters) gets wrapped with ``LoRALinear``.
 
-    attn_modules = {"q_proj", "k_proj", "v_proj", "o_proj"}
-    ffn_modules = {"gate_proj", "up_proj", "down_proj"}
-
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            # Check if this module should have LoRA applied
-            module_name = name.split(".")[-1]
-            if module_name not in target_modules:
-                continue
-
-            # Determine which LoRA config to use
-            if module_name in attn_modules and "attn" in lora_configs:
-                lora_config = lora_configs["attn"]
-            elif module_name in ffn_modules and "ffn" in lora_configs:
-                lora_config = lora_configs["ffn"]
-            else:
-                continue
-
-            # Get parent module and attribute name
-            parts = name.rsplit(".", 1)
-            if len(parts) == 2:
-                parent_name, attr_name = parts
-                parent = model.get_submodule(parent_name)
-            else:
-                parent = model
-                attr_name = name
-
-            # Replace with LoRA linear
-            lora_linear = apply_lora_to_linear(module, lora_config)
-            setattr(parent, attr_name, lora_linear)
-
-
-def freeze_non_lora_params(model: nn.Module) -> tuple[int, int]:
-    """Freeze all parameters except LoRA parameters.
-
-    Args:
-        model: The model to freeze.
+    After wrapping, parameters are frozen / unfrozen according to
+    ``config.trainable_non_lora_modules`` and ``config.vision_encoder_mode``.
 
     Returns:
-        Tuple of (frozen_params_count, trainable_params_count).
+        (frozen_param_count, trainable_param_count)
     """
-    frozen_count = 0
-    trainable_count = 0
+    if not config.enabled:
+        logger.info("LoRA is disabled, skipping")
+        total = sum(p.numel() for p in model.parameters())
+        return 0, total
 
-    for name, param in model.named_parameters():
-        if "lora_" in name:
-            param.requires_grad = True
-            trainable_count += param.numel()
-        else:
-            param.requires_grad = False
-            frozen_count += param.numel()
+    lora_config = config.get_lora_config()
+    lora_count = 0
+    lora_details: list[str] = []
 
-    return frozen_count, trainable_count
-
-
-def apply_lora_to_pi0_pytorch(
-    model: nn.Module,
-    lora_config: LoRATrainingConfig,
-) -> tuple[int, int]:
-    """Apply LoRA to PI0Pytorch model based on training config."""
-    if not lora_config.enabled:
-        logging.info("LoRA is disabled, skipping LoRA application")
-        return 0, sum(p.numel() for p in model.parameters())
-
-    lora_configs = lora_config.get_lora_configs()
-    target_modules = lora_config.target_modules
-
-    # Determine which sub-models to apply LoRA to
-    apply_to_paligemma = lora_config.apply_to in ["all", "paligemma_only", "paligemma_attn"]
-    apply_to_expert = lora_config.apply_to in ["all", "expert_only", "expert_attn"]
-
-    # Adjust target modules based on apply_to setting
-    if lora_config.apply_to in ["paligemma_attn", "expert_attn"]:
-        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
-
-    lora_applied_count = 0
-
-    # Helper function to check if a module should have LoRA applied
-    def should_apply_lora(full_name: str, module_name: str) -> bool:
-        nonlocal lora_applied_count
-
-        if module_name not in target_modules:
-            return False
-
-        # Vision tower is handled separately (not via LoRA, but full fine-tuning if enabled)
-        if "vision_tower" in full_name or "vision_model" in full_name:
-            return False
-
-        # Check if this is in paligemma language model or expert based on path
-        is_paligemma = "paligemma" in full_name and "language_model" in full_name
-        is_expert = "gemma_expert" in full_name
-
-        if is_paligemma and apply_to_paligemma:
-            return True
-        if is_expert and apply_to_expert:
-            return True
-        return False
-
-    # Determine which LoRA config to use based on module type
-    attn_modules = {"q_proj", "k_proj", "v_proj", "o_proj"}
-    ffn_modules = {"gate_proj", "up_proj", "down_proj"}
-
+    # Phase 1: wrap Linear layers with LoRALinear
+    # Use list() to snapshot because we mutate the tree in-place.
     for name, module in list(model.named_modules()):
-        if isinstance(module, nn.Linear):
-            module_name = name.split(".")[-1]
+        if not isinstance(module, nn.Linear):
+            continue
+        if _should_skip_lora(name, config):
+            continue
 
-            if not should_apply_lora(name, module_name):
-                continue
+        parent, attr = _get_parent_and_attr(model, name)
+        wrapped = LoRALinear(module, lora_config)
+        setattr(parent, attr, wrapped)
+        lora_count += 1
+        lora_details.append(
+            f"  LoRA: {name}  ({module.in_features}→{module.out_features})"
+        )
 
-            # Determine which LoRA config to use
-            if module_name in attn_modules and "attn" in lora_configs:
-                lora_cfg = lora_configs["attn"]
-            elif module_name in ffn_modules and "ffn" in lora_configs:
-                lora_cfg = lora_configs["ffn"]
-            else:
-                continue
+    logger.info(f"Applied LoRA (rank={lora_config.rank}) to {lora_count} layers:")
+    for line in lora_details:
+        logger.info(line)
 
-            # Get parent module and attribute name
-            parts = name.rsplit(".", 1)
-            if len(parts) == 2:
-                parent_name, attr_name = parts
-                parent = model.get_submodule(parent_name)
-            else:
-                parent = model
-                attr_name = name
-
-            # Replace with LoRA linear
-            lora_linear = apply_lora_to_linear(module, lora_cfg)
-            setattr(parent, attr_name, lora_linear)
-            lora_applied_count += 1
-
-    logging.info(f"Applied LoRA to {lora_applied_count} linear layers")
-
-    # Freeze non-LoRA parameters
-    frozen_count, trainable_count = freeze_for_lora_training(model, lora_config)
-
-    return frozen_count, trainable_count
+    # Phase 2: freeze / unfreeze
+    frozen, trainable = _freeze_for_lora(model, config)
+    return frozen, trainable
 
 
-def freeze_for_lora_training(
+def _freeze_for_lora(
     model: nn.Module,
-    lora_config: LoRATrainingConfig,
+    config: LoRATrainingConfig,
 ) -> tuple[int, int]:
-    """Freeze parameters for LoRA training."""
+    """Set requires_grad for LoRA training.
+
+    Rules (in priority order):
+      1. LoRA params (lora_A, lora_B)  → trainable
+      2. Vision tower                   → depends on vision_encoder_mode
+      3. Params matching trainable_non_lora_modules → trainable
+      4. Everything else                → frozen
+    """
+    trainable_set = set(config.trainable_non_lora_modules)
+
     frozen_count = 0
     trainable_count = 0
-    vision_trainable = 0
-
-    trainable_modules = set(lora_config.trainable_modules) if lora_config.train_non_lora_layers else set()
+    vision_count = 0
 
     for name, param in model.named_parameters():
-        # Check if this is a LoRA parameter
-        is_lora_param = "lora_" in name
-
-        # Check if this is a vision encoder parameter
-        is_vision_param = "vision_tower" in name or "vision_model" in name
-
-        # Check if this is a trainable non-LoRA module
-        is_trainable_module = False
-        if lora_config.train_non_lora_layers:
-            for trainable_name in trainable_modules:
-                if trainable_name in name:
-                    is_trainable_module = True
-                    break
-
-        # Determine if parameter should be trainable
         should_train = False
-        if is_lora_param:
-            should_train = True
-        elif is_vision_param:
-            # Vision encoder: train if train_vision_encoder is True
-            should_train = lora_config.train_vision_encoder
-            if should_train:
-                vision_trainable += param.numel()
-        elif is_trainable_module:
+
+        # Rule 1: LoRA params always trainable
+        if "lora_A" in name or "lora_B" in name:
             should_train = True
 
+        # Rule 2: vision tower
+        elif _is_vision_tower(name):
+            if config.vision_encoder_mode == "full":
+                should_train = True
+            elif config.vision_encoder_mode == "lora":
+                # LoRA params handled by rule 1; base weights stay frozen
+                should_train = False
+            else:  # "freeze"
+                should_train = False
+            if should_train:
+                vision_count += param.numel()
+
+        # Rule 3: trainable non-LoRA modules
+        elif any(pattern in name for pattern in trainable_set):
+            should_train = True
+
+        param.requires_grad = should_train
         if should_train:
-            param.requires_grad = True
             trainable_count += param.numel()
         else:
-            param.requires_grad = False
             frozen_count += param.numel()
 
-    logging.info(f"LoRA training: {trainable_count:,} trainable params, {frozen_count:,} frozen params")
-    logging.info(f"Trainable ratio: {trainable_count / (trainable_count + frozen_count) * 100:.4f}%")
-    if lora_config.train_vision_encoder:
-        logging.info(f"Vision encoder (SigLIP) is TRAINABLE: {vision_trainable:,} params (JAX-consistent)")
+    total = trainable_count + frozen_count
+    ratio = trainable_count / total * 100 if total > 0 else 0
+    logger.info(
+        f"LoRA freeze: {trainable_count:,} trainable, "
+        f"{frozen_count:,} frozen  ({ratio:.2f}% trainable)"
+    )
+    if config.vision_encoder_mode == "freeze":
+        logger.info("  Vision encoder (SigLIP): FROZEN")
+    elif config.vision_encoder_mode == "full":
+        logger.info(f"  Vision encoder (SigLIP): FULL-TRAIN ({vision_count:,} params)")
     else:
-        logging.info("Vision encoder (SigLIP) is FROZEN (memory-efficient mode)")
+        logger.info("  Vision encoder (SigLIP): LoRA-only")
 
     return frozen_count, trainable_count
+
+
+# ---------------------------------------------------------------------------
+# LoRA-only save / load
+# ---------------------------------------------------------------------------
+
+def get_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+    """Collect only trainable parameters (LoRA + non-LoRA trainable modules).
+
+    This is the minimal set needed to resume LoRA training or run inference
+    (after merging LoRA weights back into the base model).
+    """
+    state = {}
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            state[name] = param.data
+    return state
+
+
+def save_lora_checkpoint(
+    model: nn.Module,
+    path: str,
+    *,
+    use_safetensors: bool = True,
+) -> None:
+    """Save only the trainable (LoRA + non-LoRA) parameters.
+
+    Args:
+        model: The model (possibly wrapped in DDP).
+        path: Output file path (.safetensors or .pt).
+        use_safetensors: If True, use safetensors format (recommended).
+    """
+    # Unwrap DDP if necessary
+    raw = model.module if hasattr(model, "module") else model
+    state = get_lora_state_dict(raw)
+
+    if use_safetensors:
+        safetensors_save(state, path)
+    else:
+        torch.save(state, path)
+
+    logger.info(f"Saved LoRA checkpoint ({len(state)} tensors) to {path}")
+
+
+def load_lora_checkpoint(
+    model: nn.Module,
+    path: str,
+) -> None:
+    """Load a LoRA checkpoint (trainable params only) into *model*.
+
+    The model must already have LoRA layers injected (via ``apply_lora_to_model``).
+    Missing keys in the checkpoint are silently ignored (they keep their
+    init values), which is fine for a fresh LoRA start from base weights.
+
+    Args:
+        model: The model with LoRA layers already applied.
+        path: Path to ``.safetensors`` or ``.pt`` file.
+    """
+    if path.endswith(".safetensors"):
+        from safetensors.torch import load_file
+        state = load_file(path)
+    else:
+        state = torch.load(path, map_location="cpu", weights_only=True)
+
+    missing, unexpected = [], []
+    model_state = model.state_dict()
+    for key, val in state.items():
+        if key in model_state:
+            if model_state[key].shape == val.shape:
+                model_state[key].copy_(val)
+            else:
+                logger.warning(
+                    f"Shape mismatch for {key}: model={model_state[key].shape}, "
+                    f"ckpt={val.shape} — skipping"
+                )
+                missing.append(key)
+        else:
+            unexpected.append(key)
+
+    if missing:
+        logger.warning(f"Missing / shape-mismatch keys: {missing}")
+    if unexpected:
+        logger.warning(f"Unexpected keys in LoRA checkpoint: {unexpected}")
+    logger.info(
+        f"Loaded LoRA checkpoint from {path} "
+        f"({len(state) - len(missing) - len(unexpected)} tensors applied)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Merge all LoRA layers (for inference deployment)
+# ---------------------------------------------------------------------------
+
+def merge_lora_weights(model: nn.Module) -> int:
+    """Merge all LoRALinear layers back into their base layers.
+
+    After merging, the model behaves identically to a fully fine-tuned
+    model with no LoRA overhead.  This is **irreversible** unless you
+    saved the LoRA checkpoint separately.
+
+    Returns:
+        Number of layers merged.
+    """
+    count = 0
+    for name, module in list(model.named_modules()):
+        if isinstance(module, LoRALinear):
+            module.merge()
+            # Replace LoRALinear with the now-merged base_layer
+            parent, attr = _get_parent_and_attr(model, name)
+            setattr(parent, attr, module.base_layer)
+            count += 1
+    logger.info(f"Merged {count} LoRA layers into base weights")
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Utility: print model LoRA summary
+# ---------------------------------------------------------------------------
+
+def print_lora_summary(model: nn.Module) -> None:
+    """Print a summary of LoRA layers and trainable parameter counts."""
+    lora_params = 0
+    trainable_non_lora = 0
+    frozen_params = 0
+
+    for name, param in model.named_parameters():
+        if "lora_A" in name or "lora_B" in name:
+            lora_params += param.numel()
+        elif param.requires_grad:
+            trainable_non_lora += param.numel()
+        else:
+            frozen_params += param.numel()
+
+    total = lora_params + trainable_non_lora + frozen_params
+    logger.info("=" * 60)
+    logger.info("LoRA Summary")
+    logger.info(f"  LoRA params:            {lora_params:>12,}")
+    logger.info(f"  Trainable non-LoRA:     {trainable_non_lora:>12,}")
+    logger.info(f"  Frozen params:          {frozen_params:>12,}")
+    logger.info(f"  Total params:           {total:>12,}")
+    logger.info(f"  Trainable ratio:        {(lora_params + trainable_non_lora) / total * 100:.2f}%")
+    logger.info("=" * 60)
