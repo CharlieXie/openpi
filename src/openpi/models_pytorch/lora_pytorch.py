@@ -176,10 +176,8 @@ _DEFAULT_MODULES_TO_NOT_LORA: list[str] = [
 
 # Default modules among the skip-list that should remain trainable
 # (the rest are frozen).
-# NOTE: embed_tokens (527M) and lm_head are NOT here by default —
-#   they dominate trainable params (94%!) and defeat the purpose of
-#   LoRA.  Add them explicitly if you need to train new token
-#   embeddings (e.g. ``trainable_non_lora_modules += ["embed_tokens"]``).
+# embed_tokens (527M, nn.Embedding) and lm_head (tied) are trainable
+# because they contain waypoint token embeddings that must be learned.
 _DEFAULT_TRAINABLE_NON_LORA: list[str] = [
     "action_in_proj",
     "action_out_proj",
@@ -187,6 +185,8 @@ _DEFAULT_TRAINABLE_NON_LORA: list[str] = [
     "time_mlp_in",
     "time_mlp_out",
     "multi_modal_projector",
+    "embed_tokens",
+    "lm_head",
 ]
 
 

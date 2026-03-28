@@ -336,8 +336,11 @@ def load_joint(cfg, device):
     logger.info(f"Joint model init: {time.time() - t0:.1f}s")
 
     ckpt_path = cfg["joint_checkpoint"]
-    ckpt_file = os.path.join(ckpt_path, "model.safetensors")
-    logger.info(f"Loading joint model from {ckpt_path}")
+    # Prefer merged checkpoint (from LoRA training) if available
+    merged_file = os.path.join(ckpt_path, "model_merged.safetensors")
+    plain_file = os.path.join(ckpt_path, "model.safetensors")
+    ckpt_file = merged_file if os.path.exists(merged_file) else plain_file
+    logger.info(f"Loading joint model from {ckpt_file}")
     t0 = time.time()
     PI0WaypointJoint.load_pretrained_weights(model, ckpt_file, "cpu")
     logger.info(f"Joint weight load: {time.time() - t0:.1f}s")

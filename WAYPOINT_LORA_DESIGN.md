@@ -101,7 +101,60 @@
 
 ---
 
-## 四、参数量估计 (rank=16)
+## 四、白名单机制
+
+LoRA 使用两个列表控制每个层的行为：
+
+```
+所有 nn.Linear
+  ├── 在 lora_modules_to_skip 中？ → 不加 LoRA
+  │     ├── 在 lora_trainable_modules 中？ → 全量训练 (requires_grad=True)
+  │     └── 不在？ → 冻结 (requires_grad=False)
+  └── 不在？ → 加 LoRA (base 权重冻结, lora_A/B 可训练)
+```
+
+### `lora_modules_to_skip`（不加 LoRA 的层）
+
+包含模块路径子串。任何 `nn.Linear` 的 `named_modules()` 路径匹配其中一项就跳过 LoRA。
+
+| 默认值 | 理由 |
+|--------|------|
+| `action_in_proj` | 输入维度 32，rank=16 无压缩空间 |
+| `action_out_proj` | 输出维度 32，同上 |
+| `proprio_encoder` | 同 action_in_proj |
+| `time_mlp_in` | 联合模型新增层 (2048→1024)，必须全量训练 |
+| `time_mlp_out` | 配套 time_mlp_in |
+| `multi_modal_projector` | 视觉-语言桥接，单层参数量小 |
+| `embed_tokens` | `nn.Embedding`，不是 `nn.Linear`，不能 LoRA |
+| `lm_head` | 与 embed_tokens weight tied，不能 LoRA |
+
+### `lora_trainable_modules`（跳过的层中哪些保持可训练）
+
+| 默认值 | 理由 |
+|--------|------|
+| `action_in_proj` | AE 专用，必须训练 |
+| `action_out_proj` | AE 专用，必须训练 |
+| `proprio_encoder` | AE 专用，必须训练 |
+| `time_mlp_in` | 时间条件 MLP，必须训练 |
+| `time_mlp_out` | 时间条件 MLP，必须训练 |
+| `multi_modal_projector` | 视觉-语言桥接，需适配 |
+| `embed_tokens` | 包含 waypoint token (300 proprio + 34 duration + 4 special)，预测 waypoint 需要训练 |
+| `lm_head` | 与 embed_tokens tied（同一 tensor），需一起训练 |
+
+不在此列表的跳过层（如 `gemma_expert.lm_head`）会被冻结。
+
+### 实际效果示例
+
+| 层 | 在 skip? | 在 trainable? | 结果 |
+|---|---|---|---|
+| `language_model.layers.0.self_attn.q_proj` | 否 | — | **LoRA** |
+| `action_in_proj` | 是 | 是 | **全量训练** |
+| `embed_tokens` | 是 | 是 | **全量训练** |
+| `gemma_expert.lm_head` | 是 | 否 | **冻结** |
+
+---
+
+## 五、参数量估计 (rank=16)
 
 | 组件 | 参数量 | 说明 |
 |------|--------|------|
@@ -109,16 +162,17 @@
 | Gemma 300M expert LoRA | 6.8M | 18层 × 7 linear, rank=16 |
 | AE heads (全量训练) | 3.2M | action/proprio/time projections |
 | multi_modal_projector (全量训练) | 2.4M | 视觉-语言桥接 |
-| **总可训练 (默认)** | **32.0M** | **0.91% of model** |
-| 总冻结 | ~3,468M | backbone + expert base + embed_tokens + SigLIP |
+| embed_tokens (全量训练) | 527M | waypoint token 预测必须训练 |
+| **总可训练** | **~559M** | **~16% of model** |
+| 总冻结 | ~2,941M | backbone + expert base weights + SigLIP |
 
-> **embed_tokens (527M)** 默认冻结。若加入 trainable 会占可训练参数的 94%，
-> 违背 LoRA 参数高效微调的初衷。如需训练新增 waypoint token，可手动启用：
-> `trainable_non_lora_modules: [..., "embed_tokens"]`
+> embed_tokens 占可训练参数的 94%。若需更激进的参数高效，可在 config 中
+> 从 `lora_trainable_modules` 移除 `embed_tokens` 和 `lm_head`，
+> 可训练参数降至 32M (0.91%)。
 
 ---
 
-## 五、配置示例
+## 六、配置示例
 
 ```yaml
 # configs/waypoint_joint_libero.yaml
@@ -131,11 +185,31 @@ lora_use_rslora: false
 lora_init: true                 # true/"kaiming" (default) or "gaussian"
 lora_apply_to: all              # "all" | "backbone_only" | "expert_only"
 vision_encoder_mode: freeze     # "freeze" | "lora" | "full"
+
+# 白名单配置 (可选，一般不需要修改)
+# lora_modules_to_skip:         # 不加 LoRA 的层
+#   - action_in_proj
+#   - action_out_proj
+#   - proprio_encoder
+#   - time_mlp_in
+#   - time_mlp_out
+#   - multi_modal_projector
+#   - embed_tokens
+#   - lm_head
+# lora_trainable_modules:       # 跳过的层中哪些保持可训练
+#   - action_in_proj
+#   - action_out_proj
+#   - proprio_encoder
+#   - time_mlp_in
+#   - time_mlp_out
+#   - multi_modal_projector
+#   - embed_tokens
+#   - lm_head
 ```
 
 ---
 
-## 六、核心实现 (`lora_pytorch.py`)
+## 七、核心实现 (`lora_pytorch.py`)
 
 ### LoRALinear 包装层
 
@@ -167,22 +241,37 @@ apply_lora_to_model(model, config)
        └─ everything else → frozen
 ```
 
-### 保存/加载
+### 保存/加载/合并
+
+训练时只保存 LoRA 权重（~100MB），不保存完整模型（~7GB），**不额外占用 GPU 内存**。
+
+```
+训练输出:
+  checkpoints/exp/500/
+  ├── lora.safetensors     # ~100MB, LoRA + 非 LoRA 可训练参数
+  └── metadata.pt          # step 信息
+```
 
 ```python
-# 保存 (只保存可训练参数)
-save_lora_checkpoint(model, "checkpoints/100/lora.safetensors")
+# 保存 (只保存可训练参数, 训练时自动调用)
+save_lora_checkpoint(model, "checkpoints/500/lora.safetensors")
 
-# 加载
-load_lora_checkpoint(model, "checkpoints/100/lora.safetensors")
+# 加载 (恢复训练)
+load_lora_checkpoint(model, "checkpoints/500/lora.safetensors")
 
-# 推理：merge 后无 LoRA 开销
-merge_lora_weights(model)
+# 推理：用独立脚本合并 (不需要 GPU)
+# python scripts/merge_lora.py \
+#     --base /path/to/base/model.safetensors \
+#     --lora checkpoints/500/lora.safetensors \
+#     --config configs/waypoint_joint_libero.yaml \
+#     --output checkpoints/500/model_merged.safetensors
 ```
+
+**eval 自动检测**: eval 脚本优先加载 `model_merged.safetensors`，不存在则回退到 `model.safetensors`。
 
 ---
 
-## 七、与 gradient_strategy 的交互
+## 八、与 gradient_strategy 的交互
 
 LoRA 模式下，`gradient_strategy` 仍然正常工作：
 
@@ -197,9 +286,13 @@ LoRA 模式下，`gradient_strategy` 仍然正常工作：
 
 ---
 
-## 八、文件变更
+## 九、文件变更
 
 | 文件 | 变更 |
 |------|------|
 | `src/openpi/models_pytorch/lora_pytorch.py` | 重写: PEFT 风格 LoRA |
 | `scripts/train_waypoint_joint.py` | 更新 LoRA 初始化 + LoRA-only 保存 |
+| `scripts/merge_lora.py` | 新增: 独立 LoRA merge 脚本 |
+| `src/openpi/waypoint/eval_libero.py` | 更新: 自动检测 model_merged.safetensors |
+| `configs/waypoint_joint_libero.yaml` | 更新: 白名单配置项 |
+| `configs/waypoint_joint_calvin.yaml` | 更新: 白名单配置项 |

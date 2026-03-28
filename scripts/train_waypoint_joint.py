@@ -178,16 +178,22 @@ def train_joint(cfg, device, use_ddp, is_main):
         if vision_mode is None:
             vision_mode = "full" if cfg.get("train_vision_encoder", False) else "freeze"
 
-        lora_cfg = lora_utils.LoRATrainingConfig(
+        lora_kwargs = dict(
             enabled=True,
             rank=cfg.get("lora_rank", 16),
             alpha=cfg.get("lora_alpha", 16.0),
             dropout=cfg.get("lora_dropout", 0.0),
             use_rslora=cfg.get("lora_use_rslora", False),
-            init_lora_weights=cfg.get("lora_init", True),  # True/"kaiming" or "gaussian"
+            init_lora_weights=cfg.get("lora_init", True),
             vision_encoder_mode=vision_mode,
             apply_to=cfg.get("lora_apply_to", "all"),
         )
+        # Optional: override skip-list / trainable-list from config
+        if "lora_modules_to_skip" in cfg:
+            lora_kwargs["modules_to_not_lora"] = cfg["lora_modules_to_skip"]
+        if "lora_trainable_modules" in cfg:
+            lora_kwargs["trainable_non_lora_modules"] = cfg["lora_trainable_modules"]
+        lora_cfg = lora_utils.LoRATrainingConfig(**lora_kwargs)
         frozen, trainable = lora_utils.apply_lora_to_model(model, lora_cfg)
         lora_utils.print_lora_summary(model)
         logging.info(f"LoRA applied: {trainable:,} trainable, {frozen:,} frozen")
@@ -370,12 +376,17 @@ def train_joint(cfg, device, use_ddp, is_main):
             start_time = time.time()
 
         step_for_save = global_step + 1
-        save_checkpoint(model, optimizer, step_for_save, save_dir, is_main, save_interval)
-        # Save LoRA-only checkpoint alongside full checkpoint
-        if lora_enabled and is_main and step_for_save % save_interval == 0:
-            import openpi.models_pytorch.lora_pytorch as lora_utils
-            lora_path = save_dir / f"{step_for_save}" / "lora.safetensors"
-            lora_utils.save_lora_checkpoint(model, str(lora_path))
+        if lora_enabled:
+            # LoRA mode: only save lora.safetensors (small, no extra memory).
+            # Use scripts/merge_lora.py to merge into a full model for eval.
+            if is_main and step_for_save % save_interval == 0:
+                import openpi.models_pytorch.lora_pytorch as lora_utils
+                ckpt_dir = save_dir / f"{step_for_save}"
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+                lora_utils.save_lora_checkpoint(model, str(ckpt_dir / "lora.safetensors"))
+                torch.save({"global_step": step_for_save}, str(ckpt_dir / "metadata.pt"))
+        else:
+            save_checkpoint(model, optimizer, step_for_save, save_dir, is_main, save_interval)
         if pbar:
             pbar.update(1)
             pbar.set_postfix(

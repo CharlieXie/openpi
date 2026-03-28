@@ -73,11 +73,42 @@ log_interval: 3
 wandb_enabled: true
 wandb_project: waypoint_e2e
 
-# LoRA (set to true for low-memory training)
+# LoRA (set to true for parameter-efficient fine-tuning)
 lora_enabled: false
 lora_rank: 16
 lora_alpha: 16.0
-train_vision_encoder: true
+# lora_init: true              # true/"kaiming" (default) or "gaussian"
+# lora_dropout: 0.0
+# lora_use_rslora: false
+# lora_apply_to: all           # "all" | "backbone_only" | "expert_only"
+# vision_encoder_mode: freeze  # "freeze" (default) | "lora" | "full"
+train_vision_encoder: true      # (legacy) maps to vision_encoder_mode if not set
+
+# LoRA skip-list: these modules are NOT wrapped with LoRA.
+# They are either full-trained or frozen, controlled by lora_trainable_modules.
+# (Uncomment to override defaults — most users don't need to change these)
+# lora_modules_to_skip:
+#   - action_in_proj
+#   - action_out_proj
+#   - proprio_encoder
+#   - time_mlp_in
+#   - time_mlp_out
+#   - multi_modal_projector
+#   - embed_tokens              # nn.Embedding, can't LoRA
+#   - lm_head                   # tied with embed_tokens, can't LoRA
+
+# LoRA trainable list: among skipped modules, which ones stay trainable?
+# Modules in skip-list but NOT here → frozen.
+# (Uncomment to override defaults)
+# lora_trainable_modules:
+#   - action_in_proj
+#   - action_out_proj
+#   - proprio_encoder
+#   - time_mlp_in
+#   - time_mlp_out
+#   - multi_modal_projector
+#   - embed_tokens              # needed for waypoint token prediction
+#   - lm_head                   # tied with embed_tokens
 
 # Resume from checkpoint
 resume: false

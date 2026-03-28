@@ -9,6 +9,9 @@ task_suite: libero_10
 
 # Joint model checkpoint (single checkpoint with shared backbone)
 # When "joint_checkpoint" is present, eval_libero auto-detects joint mode.
+# For LoRA-trained models, use the merged checkpoint (model_merged.safetensors):
+#   the training script auto-exports it alongside lora.safetensors.
+#   eval loads model_merged.safetensors or model.safetensors from this dir.
 joint_checkpoint: /projects/chuanlia001ssd/repos/pi_train/checkpoints/waypoint_joint_libero_10_sg_0.1_t2/900
 
 # Data / normalization
