@@ -80,42 +80,57 @@
 | `up_proj` | 1024→4096 | **是** |
 | `down_proj` | 4096→1024 | **是** |
 
-### embed_tokens / lm_head — 重要说明
+### embed_tokens / lm_head — LoRAEmbedding
 
-| 层 | 类型 | 尺寸 | LoRA? | 理由 |
-|----|------|------|-------|------|
-| `embed_tokens` | `nn.Embedding` | 257152×2048 (527M) | **不能** | 不是 `nn.Linear`，当前 LoRA 不支持 Embedding |
-| `paligemma.lm_head` | `nn.Linear` | 2048→257152 | **不能** | weight 与 embed_tokens **tied**（同一 tensor） |
-| `gemma_expert.lm_head` | `nn.Linear` | 1024→257152 (263M) | **否** — 冻结 | embed_tokens=None, 未使用 |
+| 层 | 类型 | 尺寸 | 处理方式 | 说明 |
+|----|------|------|----------|------|
+| `embed_tokens` | `nn.Embedding` | 257152×2048 (527M) | **LoRAEmbedding** | LoRA A (257152×r) + B (r×2048)，省 ~5GB optimizer |
+| `paligemma.lm_head` | `nn.Linear` | 2048→257152 | **冻结** (skip-list) | weight tied, logits 通过 LoRAEmbedding.compute_logits() |
+| `gemma_expert.lm_head` | `nn.Linear` | 1024→257152 (263M) | **冻结** (skip-list) | embed_tokens=None, 未使用 |
 
-**weight tying 关键分析：**
-- `lm_head.weight IS embed_tokens.weight` — HuggingFace `post_init()` / `tie_weights()` 使它们是同一个 tensor
-- Joint model **从不调用** `lm_head.forward()`，而是直接用 `embed_tokens.weight` 做 `F.linear()`
-- 如果 LoRA wrap `lm_head`：(a) LoRA forward 永远不被调用 → 死参数 (b) state_dict key 变化 → 打断 weight tying
-- PEFT 也显式排除 `get_output_embeddings()` (见 `tuners_utils.py`)
+**LoRAEmbedding 工作原理：**
 
-**在全量训练（无 LoRA）中的占比：**
-- `embed_tokens` (=lm_head, tied): 527M = **全部 3.5B 参数的 15%**
-- `expert.lm_head` (独立, 未使用): 263M = 7.5%
-- 两者合计: 790M = **22.5% 的参数用于从不使用的 lm_head 或不可 LoRA 的 Embedding**
+```
+Embedding 查找 (forward):
+  y = base_embed(token_id) + A[token_id] @ B * scaling
+  A: (vocab_size, rank) → 每个 token 一个 rank 维向量
+  B: (rank, embed_dim)  → 共享投影矩阵
+
+Logits 计算 (compute_logits):
+  logits = hidden @ W^T + (hidden @ B^T @ A^T) * scaling
+  等价于对 lm_head 施加 LoRA，但不需要包装 lm_head 本身
+```
+
+**解决 weight tying 问题**：不直接 LoRA lm_head（会打断 tying），而是在
+`LoRAEmbedding.compute_logits()` 中数学等价地施加 LoRA 修正。
+Joint model 的 `_compute_lm_logits()` 自动检测并调用。
+
+**内存对比：**
+
+| 做法 | embed_tokens optimizer 开销 | 说明 |
+|------|---|---|
+| 全量训练 | ~4.2 GB (AdamW m+v) | 之前的默认做法 |
+| LoRAEmbedding (rank=16) | ~33 MB | A: 4.1M + B: 32K 参数 |
+| **节省** | **~4.2 GB** | |
 
 ---
 
 ## 四、白名单机制
 
-LoRA 使用两个列表控制每个层的行为：
+LoRA 使用两个列表控制每个 `nn.Linear` 的行为，`nn.Embedding`（embed_tokens）单独处理：
 
 ```
+nn.Embedding (名为 embed_tokens)
+  └── LoRAEmbedding 包装 (LoRA A/B 可训练, base 冻结)
+
 所有 nn.Linear
   ├── 在 lora_modules_to_skip 中？ → 不加 LoRA
   │     ├── 在 lora_trainable_modules 中？ → 全量训练 (requires_grad=True)
   │     └── 不在？ → 冻结 (requires_grad=False)
-  └── 不在？ → 加 LoRA (base 权重冻结, lora_A/B 可训练)
+  └── 不在？ → 加 LoRALinear (base 权重冻结, lora_A/B 可训练)
 ```
 
-### `lora_modules_to_skip`（不加 LoRA 的层）
-
-包含模块路径子串。任何 `nn.Linear` 的 `named_modules()` 路径匹配其中一项就跳过 LoRA。
+### `lora_modules_to_skip`（不加 LoRA 的 nn.Linear）
 
 | 默认值 | 理由 |
 |--------|------|
@@ -125,8 +140,7 @@ LoRA 使用两个列表控制每个层的行为：
 | `time_mlp_in` | 联合模型新增层 (2048→1024)，必须全量训练 |
 | `time_mlp_out` | 配套 time_mlp_in |
 | `multi_modal_projector` | 视觉-语言桥接，单层参数量小 |
-| `embed_tokens` | `nn.Embedding`，不是 `nn.Linear`，不能 LoRA |
-| `lm_head` | 与 embed_tokens weight tied，不能 LoRA |
+| `lm_head` | 与 embed_tokens weight tied, logits 通过 LoRAEmbedding.compute_logits() |
 
 ### `lora_trainable_modules`（跳过的层中哪些保持可训练）
 
@@ -138,19 +152,17 @@ LoRA 使用两个列表控制每个层的行为：
 | `time_mlp_in` | 时间条件 MLP，必须训练 |
 | `time_mlp_out` | 时间条件 MLP，必须训练 |
 | `multi_modal_projector` | 视觉-语言桥接，需适配 |
-| `embed_tokens` | 包含 waypoint token (300 proprio + 34 duration + 4 special)，预测 waypoint 需要训练 |
-| `lm_head` | 与 embed_tokens tied（同一 tensor），需一起训练 |
 
-不在此列表的跳过层（如 `gemma_expert.lm_head`）会被冻结。
+不在此列表的跳过层（如 `lm_head`, `gemma_expert.lm_head`）会被冻结。
 
 ### 实际效果示例
 
-| 层 | 在 skip? | 在 trainable? | 结果 |
-|---|---|---|---|
-| `language_model.layers.0.self_attn.q_proj` | 否 | — | **LoRA** |
-| `action_in_proj` | 是 | 是 | **全量训练** |
-| `embed_tokens` | 是 | 是 | **全量训练** |
-| `gemma_expert.lm_head` | 是 | 否 | **冻结** |
+| 层 | 结果 |
+|---|---|
+| `language_model.embed_tokens` (Embedding) | **LoRAEmbedding** (A/B 可训练, base 冻结) |
+| `language_model.layers.0.self_attn.q_proj` (Linear) | **LoRALinear** |
+| `action_in_proj` (Linear, 在 skip+trainable) | **全量训练** |
+| `lm_head` (Linear, 在 skip, 不在 trainable) | **冻结** |
 
 ---
 
@@ -160,15 +172,14 @@ LoRA 使用两个列表控制每个层的行为：
 |------|--------|------|
 | Gemma 2B backbone LoRA | 19.6M | 18层 × 7 linear, rank=16 |
 | Gemma 300M expert LoRA | 6.8M | 18层 × 7 linear, rank=16 |
+| embed_tokens LoRA | 4.1M | LoRAEmbedding A (257152×16) + B (16×2048) |
 | AE heads (全量训练) | 3.2M | action/proprio/time projections |
 | multi_modal_projector (全量训练) | 2.4M | 视觉-语言桥接 |
-| embed_tokens (全量训练) | 527M | waypoint token 预测必须训练 |
-| **总可训练** | **~559M** | **~16% of model** |
-| 总冻结 | ~2,941M | backbone + expert base weights + SigLIP |
+| **总可训练** | **~36M** | **~1.0% of model** |
+| 总冻结 | ~3,464M | backbone + expert base + embed_tokens base + SigLIP |
 
-> embed_tokens 占可训练参数的 94%。若需更激进的参数高效，可在 config 中
-> 从 `lora_trainable_modules` 移除 `embed_tokens` 和 `lm_head`，
-> 可训练参数降至 32M (0.91%)。
+> 对比全量训练 embed_tokens (527M → optimizer 4.2GB)，
+> LoRAEmbedding (4.1M → optimizer 33MB) **省 ~4.2GB 显存**。
 
 ---
 
@@ -286,13 +297,67 @@ LoRA 模式下，`gradient_strategy` 仍然正常工作：
 
 ---
 
-## 九、文件变更
+## 九、端到端工作流
+
+### 1. 训练
+
+```bash
+# 在 config 中设置 lora_enabled: true，然后正常训练
+torchrun --standalone --nproc_per_node=2 \
+    scripts/train_waypoint_joint.py --config configs/waypoint_joint_libero.yaml
+```
+
+训练输出（每个 checkpoint 目录）：
+```
+checkpoints/exp/500/
+├── lora.safetensors   # ~几十MB: LoRA 参数 + AE heads 等可训练参数
+└── metadata.pt        # step 信息
+```
+
+训练时**不保存完整模型**，只保存可训练参数，不占额外 GPU 内存。
+
+### 2. 合并 (CPU 即可)
+
+```bash
+python scripts/merge_lora.py \
+    --base /path/to/pretrained/model.safetensors \
+    --lora checkpoints/exp/500/lora.safetensors \
+    --config configs/waypoint_joint_libero.yaml \
+    --output checkpoints/exp/500/model_merged.safetensors
+```
+
+流程：构建空模型 → 加载 base 权重 → 注入 LoRA 结构 → 加载 LoRA 权重 → merge → 导出。
+
+- `--base`: 训练 config 里 `pretrained_weight_path` 指向的模型权重
+- `--config`: 与训练**相同的 config**（需要一致的 LoRA rank/apply_to/vision_encoder_mode 等）
+- 输出的 `model_merged.safetensors` 是标准模型格式，无 LoRA wrapper
+
+### 3. 评测
+
+```bash
+# eval config 的 joint_checkpoint 指向 checkpoint 目录
+# eval 自动优先加载 model_merged.safetensors，不存在则回退 model.safetensors
+python -m openpi.waypoint.eval_libero \
+    --config configs/eval_waypoint_joint_libero.yaml
+```
+
+**不需要修改 eval config 或 eval 代码**。合并后的模型是标准格式，eval 直接加载。
+
+### 4. lora_enabled: false 时
+
+完全走原来的全量训练流程，**所有 LoRA 代码不执行**，行为与 LoRA 实现前 100% 一致。
+
+---
+
+## 十、文件变更
 
 | 文件 | 变更 |
 |------|------|
-| `src/openpi/models_pytorch/lora_pytorch.py` | 重写: PEFT 风格 LoRA |
-| `scripts/train_waypoint_joint.py` | 更新 LoRA 初始化 + LoRA-only 保存 |
-| `scripts/merge_lora.py` | 新增: 独立 LoRA merge 脚本 |
-| `src/openpi/waypoint/eval_libero.py` | 更新: 自动检测 model_merged.safetensors |
-| `configs/waypoint_joint_libero.yaml` | 更新: 白名单配置项 |
-| `configs/waypoint_joint_calvin.yaml` | 更新: 白名单配置项 |
+| `src/openpi/models_pytorch/lora_pytorch.py` | PEFT 风格 LoRA: LoRALinear + LoRAEmbedding |
+| `src/openpi/waypoint/joint_model.py` | `_compute_lm_logits()` 支持 LoRAEmbedding logits |
+| `scripts/train_waypoint_joint.py` | LoRA 初始化 + LoRA-only 保存 |
+| `scripts/merge_lora.py` | 独立 LoRA merge 脚本 |
+| `src/openpi/waypoint/eval_libero.py` | 自动检测 model_merged.safetensors |
+| `configs/waypoint_joint_libero.yaml` | LoRA 配置项 + 白名单 |
+| `configs/waypoint_joint_calvin.yaml` | LoRA 配置项 + 白名单 |
+| `WAYPOINT_LORA_DESIGN.md` | 本文档 |

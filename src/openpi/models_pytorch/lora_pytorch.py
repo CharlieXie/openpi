@@ -20,6 +20,7 @@ from typing import Literal
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from safetensors.torch import save_file as safetensors_save
 
 logger = logging.getLogger(__name__)
@@ -147,6 +148,105 @@ class LoRALinear(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# LoRAEmbedding — PEFT-style wrapper for nn.Embedding (zero-copy)
+# ---------------------------------------------------------------------------
+
+class LoRAEmbedding(nn.Module):
+    """Wraps an existing ``nn.Embedding`` with LoRA adapters.
+
+    Forward (token lookup)::
+
+        y = base_layer(x) + A[x] @ B * scaling
+
+    Also provides ``compute_logits(hidden)`` for using the same weight as
+    a linear output head (lm_head), with LoRA correction::
+
+        logits = hidden @ W^T + (hidden @ B^T @ A^T) * scaling
+    """
+
+    def __init__(self, base_layer: nn.Embedding, config: LoRAConfig):
+        super().__init__()
+        self.base_layer = base_layer
+        self.config = config
+        num_embeddings = base_layer.num_embeddings
+        embedding_dim = base_layer.embedding_dim
+
+        # LoRA parameters (nn.Parameter, not nn.Linear — following PEFT)
+        # A: (num_embeddings, rank) — per-token low-rank vector
+        # B: (rank, embedding_dim) — shared projection
+        self.lora_embedding_A = nn.Parameter(
+            torch.zeros(num_embeddings, config.rank)
+        )
+        self.lora_embedding_B = nn.Parameter(
+            torch.zeros(config.rank, embedding_dim)
+        )
+        self.scaling = config.scaling
+
+        # Init: A = zeros, B = normal → initial LoRA output is 0 (PEFT convention)
+        nn.init.zeros_(self.lora_embedding_A)
+        nn.init.normal_(self.lora_embedding_B)
+
+        # Place on same device / dtype as base
+        device = base_layer.weight.device
+        dtype = base_layer.weight.dtype
+        self.lora_embedding_A.data = self.lora_embedding_A.data.to(device=device, dtype=dtype)
+        self.lora_embedding_B.data = self.lora_embedding_B.data.to(device=device, dtype=dtype)
+
+    # -- forward (embedding lookup) ----------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        result = self.base_layer(x)
+        # LoRA: look up A rows for each token, project through B
+        after_A = F.embedding(x, self.lora_embedding_A)   # (..., rank)
+        lora_out = after_A @ self.lora_embedding_B         # (..., embed_dim)
+        return result + lora_out * self.scaling
+
+    # -- logits (use embedding weight as lm_head) --------------------------
+    def compute_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Compute logits using embedding weight as output projection.
+
+        Equivalent to ``F.linear(hidden, W) + LoRA_correction``
+        where W = base_layer.weight.
+
+        This is needed because joint_model uses embed_tokens.weight
+        directly for logits via ``F.linear(h, weight)``, bypassing any
+        separate lm_head module.
+        """
+        base = F.linear(hidden, self.base_layer.weight)
+        # LoRA correction: hidden @ B^T @ A^T * scaling
+        intermediate = F.linear(hidden, self.lora_embedding_B)    # (..., rank)
+        lora = F.linear(intermediate, self.lora_embedding_A)      # (..., vocab)
+        return base + lora * self.scaling
+
+    # -- merge for inference -----------------------------------------------
+    def merge(self) -> None:
+        """Merge LoRA into base embedding weight."""
+        with torch.no_grad():
+            # W_new = W + A @ B * scaling
+            delta = (self.lora_embedding_A @ self.lora_embedding_B) * self.scaling
+            self.base_layer.weight.data += delta.to(self.base_layer.weight.dtype)
+
+    # -- convenience properties -------------------------------------------
+    @property
+    def weight(self) -> nn.Parameter:
+        return self.base_layer.weight
+
+    @property
+    def num_embeddings(self) -> int:
+        return self.base_layer.num_embeddings
+
+    @property
+    def embedding_dim(self) -> int:
+        return self.base_layer.embedding_dim
+
+    def extra_repr(self) -> str:
+        return (
+            f"num_embeddings={self.num_embeddings}, "
+            f"embedding_dim={self.embedding_dim}, "
+            f"lora_rank={self.config.rank}, lora_alpha={self.config.alpha}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Training-level config
 # ---------------------------------------------------------------------------
 
@@ -162,22 +262,16 @@ _DEFAULT_MODULES_TO_NOT_LORA: list[str] = [
     "time_mlp_out",
     # Vision-language bridge: single small layer
     "multi_modal_projector",
-    # embed_tokens is nn.Embedding (not nn.Linear) — won't be LoRA'd anyway,
-    # but listed here to also exclude from trainable_non_lora_modules.
-    "embed_tokens",
+    # NOTE: embed_tokens is NOT here — it gets LoRA via LoRAEmbedding.
     # lm_head (nn.Linear) is weight-tied with embed_tokens (same tensor).
-    # Joint model never calls lm_head.forward() — it uses embed_tokens.weight
-    # directly via F.linear(). LoRA on lm_head would:
-    #   (a) allocate dead params (forward never called → no gradients)
-    #   (b) break weight tying (state_dict key changes to .base_layer.weight)
-    # PEFT also explicitly excludes get_output_embeddings() for this reason.
+    # Joint model never calls lm_head.forward(); logits go through
+    # LoRAEmbedding.compute_logits() instead.  LoRA on lm_head would
+    # allocate dead params and break weight tying.
     "lm_head",
 ]
 
 # Default modules among the skip-list that should remain trainable
 # (the rest are frozen).
-# embed_tokens (527M, nn.Embedding) and lm_head (tied) are trainable
-# because they contain waypoint token embeddings that must be learned.
 _DEFAULT_TRAINABLE_NON_LORA: list[str] = [
     "action_in_proj",
     "action_out_proj",
@@ -185,8 +279,9 @@ _DEFAULT_TRAINABLE_NON_LORA: list[str] = [
     "time_mlp_in",
     "time_mlp_out",
     "multi_modal_projector",
-    "embed_tokens",
-    "lm_head",
+    # NOTE: embed_tokens is NOT here — handled by LoRAEmbedding.
+    # lm_head is NOT here — frozen (tied to embed_tokens base weight,
+    # logits go through LoRAEmbedding.compute_logits()).
 ]
 
 
@@ -299,21 +394,30 @@ def apply_lora_to_model(
     lora_count = 0
     lora_details: list[str] = []
 
-    # Phase 1: wrap Linear layers with LoRALinear
+    # Phase 1: wrap layers with LoRA wrappers
     # Use list() to snapshot because we mutate the tree in-place.
     for name, module in list(model.named_modules()):
-        if not isinstance(module, nn.Linear):
-            continue
-        if _should_skip_lora(name, config):
-            continue
-
-        parent, attr = _get_parent_and_attr(model, name)
-        wrapped = LoRALinear(module, lora_config)
-        setattr(parent, attr, wrapped)
-        lora_count += 1
-        lora_details.append(
-            f"  LoRA: {name}  ({module.in_features}→{module.out_features})"
-        )
+        if isinstance(module, nn.Linear):
+            if _should_skip_lora(name, config):
+                continue
+            parent, attr = _get_parent_and_attr(model, name)
+            setattr(parent, attr, LoRALinear(module, lora_config))
+            lora_count += 1
+            lora_details.append(
+                f"  LoRA Linear: {name}  ({module.in_features}→{module.out_features})"
+            )
+        elif isinstance(module, nn.Embedding):
+            # Only LoRA embed_tokens, not position/patch embeddings
+            if not name.endswith("embed_tokens"):
+                continue
+            if _should_skip_lora(name, config):
+                continue
+            parent, attr = _get_parent_and_attr(model, name)
+            setattr(parent, attr, LoRAEmbedding(module, lora_config))
+            lora_count += 1
+            lora_details.append(
+                f"  LoRA Embedding: {name}  ({module.num_embeddings}×{module.embedding_dim})"
+            )
 
     logger.info(f"Applied LoRA (rank={lora_config.rank}) to {lora_count} layers:")
     for line in lora_details:
@@ -346,7 +450,7 @@ def _freeze_for_lora(
         should_train = False
 
         # Rule 1: LoRA params always trainable
-        if "lora_A" in name or "lora_B" in name:
+        if "lora_A" in name or "lora_B" in name or "lora_embedding" in name:
             should_train = True
 
         # Rule 2: vision tower
@@ -479,7 +583,7 @@ def load_lora_checkpoint(
 # ---------------------------------------------------------------------------
 
 def merge_lora_weights(model: nn.Module) -> int:
-    """Merge all LoRALinear layers back into their base layers.
+    """Merge all LoRA layers (LoRALinear + LoRAEmbedding) back into base layers.
 
     After merging, the model behaves identically to a fully fine-tuned
     model with no LoRA overhead.  This is **irreversible** unless you
@@ -490,9 +594,8 @@ def merge_lora_weights(model: nn.Module) -> int:
     """
     count = 0
     for name, module in list(model.named_modules()):
-        if isinstance(module, LoRALinear):
+        if isinstance(module, (LoRALinear, LoRAEmbedding)):
             module.merge()
-            # Replace LoRALinear with the now-merged base_layer
             parent, attr = _get_parent_and_attr(model, name)
             setattr(parent, attr, module.base_layer)
             count += 1
@@ -511,7 +614,7 @@ def print_lora_summary(model: nn.Module) -> None:
     frozen_params = 0
 
     for name, param in model.named_parameters():
-        if "lora_A" in name or "lora_B" in name:
+        if "lora_A" in name or "lora_B" in name or "lora_embedding" in name:
             lora_params += param.numel()
         elif param.requires_grad:
             trainable_non_lora += param.numel()

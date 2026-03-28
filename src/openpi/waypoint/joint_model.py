@@ -127,6 +127,21 @@ class PI0WaypointJoint(nn.Module):
         return func(*args, **kwargs)
 
     # ------------------------------------------------------------------
+    # LM logits helper (supports LoRAEmbedding)
+    # ------------------------------------------------------------------
+    def _compute_lm_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Compute LM logits from hidden states.
+
+        If embed_tokens has been wrapped with LoRAEmbedding, uses
+        ``compute_logits()`` which applies the LoRA correction.
+        Otherwise falls back to plain ``F.linear(h, weight)``.
+        """
+        embed_layer = self.paligemma_with_expert.paligemma.language_model.embed_tokens
+        if hasattr(embed_layer, "compute_logits"):
+            return embed_layer.compute_logits(hidden)
+        return F.linear(hidden, embed_layer.weight)
+
+    # ------------------------------------------------------------------
     # DDP-compatible forward dispatcher
     # ------------------------------------------------------------------
     def forward(self, mode: str, **kwargs):
@@ -298,12 +313,11 @@ class PI0WaypointJoint(nn.Module):
 
         shift_loss_mask = full_loss_mask[:, 1:]
 
-        lm_head_weight = self.paligemma_with_expert.paligemma.language_model.embed_tokens.weight
         mask = shift_loss_mask
         if mask.any():
             active_hidden = hidden[mask]
             active_targets = targets[mask]
-            active_logits = F.linear(active_hidden.float(), lm_head_weight.float())
+            active_logits = self._compute_lm_logits(active_hidden.float())
             loss = F.cross_entropy(active_logits, active_targets)
         else:
             loss = torch.tensor(0.0, device=device, requires_grad=True)
@@ -477,8 +491,7 @@ class PI0WaypointJoint(nn.Module):
         past_kv = outputs.past_key_values
         last_hidden = outputs.last_hidden_state[:, -1:]
 
-        lm_head_weight = paligemma.language_model.embed_tokens.weight
-        last_logits = F.linear(last_hidden.float(), lm_head_weight.float())
+        last_logits = self._compute_lm_logits(last_hidden.float())
 
         tpw = wp_tokenizer.tokens_per_waypoint
         prefill_len = torch.sum(prefix_pad, dim=-1)
@@ -569,7 +582,7 @@ class PI0WaypointJoint(nn.Module):
             )
             past_kv = outputs.past_key_values
             last_hidden = outputs.last_hidden_state
-            last_logits = F.linear(last_hidden.float(), lm_head_weight.float())
+            last_logits = self._compute_lm_logits(last_hidden.float())
 
             all_done = all(len(t) >= tpw * wp_tokenizer.num_waypoints for t in all_output_tokens)
             if all_done:

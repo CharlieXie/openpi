@@ -84,8 +84,9 @@ lora_alpha: 16.0
 # vision_encoder_mode: freeze  # "freeze" (default) | "lora" | "full"
 train_vision_encoder: true      # (legacy) maps to vision_encoder_mode if not set
 
-# LoRA skip-list: these modules are NOT wrapped with LoRA.
+# LoRA skip-list: these nn.Linear modules are NOT wrapped with LoRA.
 # They are either full-trained or frozen, controlled by lora_trainable_modules.
+# NOTE: embed_tokens (nn.Embedding) gets LoRA via LoRAEmbedding automatically.
 # (Uncomment to override defaults — most users don't need to change these)
 # lora_modules_to_skip:
 #   - action_in_proj
@@ -94,8 +95,7 @@ train_vision_encoder: true      # (legacy) maps to vision_encoder_mode if not se
 #   - time_mlp_in
 #   - time_mlp_out
 #   - multi_modal_projector
-#   - embed_tokens              # nn.Embedding, can't LoRA
-#   - lm_head                   # tied with embed_tokens, can't LoRA
+#   - lm_head                   # tied with embed_tokens, logits via LoRAEmbedding
 
 # LoRA trainable list: among skipped modules, which ones stay trainable?
 # Modules in skip-list but NOT here → frozen.
@@ -107,8 +107,6 @@ train_vision_encoder: true      # (legacy) maps to vision_encoder_mode if not se
 #   - time_mlp_in
 #   - time_mlp_out
 #   - multi_modal_projector
-#   - embed_tokens              # needed for waypoint token prediction
-#   - lm_head                   # tied with embed_tokens
 
 # Resume from checkpoint
 resume: false
