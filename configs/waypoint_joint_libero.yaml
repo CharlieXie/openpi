@@ -29,8 +29,8 @@ num_waypoints: 7
 vlm_max_token_len: 256
 stride: 1
 
-# Pretrained weights (Pi0.5 base)
-pretrained_weight_path: /workspace/model/1000
+# Pretrained weights — LoRA-merged checkpoint (base + step-800 LoRA)
+pretrained_weight_path: /workspace/model/merged_libero_10_800
 
 # --- Joint training ---
 gradient_strategy: scale_gradient       # "none" | "stop_gradient" | "scale_gradient" | "freeze_backbone"
@@ -38,13 +38,13 @@ gradient_scale: 0.3                     # only used when gradient_strategy=scale
 ae_loss_weight: 1.0
 
 # Batch sizes (per GPU)
-vlm_batch_size: 256
-ae_batch_size: 256
+vlm_batch_size: 280
+ae_batch_size: 280
 
 # Training hyperparameters
-num_train_steps: 1000
+num_train_steps: 1500
 warmup_steps: 40
-peak_lr: 1.5e-4
+peak_lr: 2.0e-4
 end_lr: 1.0e-7
 
 # Normalization
@@ -66,7 +66,7 @@ vlm_shuffle_buffer_size: 5000
 ae_shuffle_buffer_size: 1000
 
 # Logging and checkpointing
-exp_name: waypoint_joint_libero_10_lora_sg_0.3
+exp_name: waypoint_joint_libero_10_lora_sg_0.3_t1
 checkpoint_dir: checkpoints/{exp_name}
 save_interval: 100
 log_interval: 4

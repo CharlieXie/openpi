@@ -68,7 +68,7 @@ def main():
     import openpi.models.pi0_config as pi0_config
     from openpi.waypoint.joint_model import PI0WaypointJoint
 
-    model_cfg = pi0_config.Pi05Config(
+    model_cfg = pi0_config.Pi0Config(
         paligemma_variant=cfg.get("paligemma_variant", "gemma_2b"),
         action_expert_variant=cfg.get("action_expert_variant", "gemma_300m"),
         action_dim=cfg.get("model_action_dim", 32),
