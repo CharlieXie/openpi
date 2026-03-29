@@ -459,6 +459,12 @@ def evaluate(cfg):
     ep_len = cfg.get("ep_len", 360)
     eval_sequences = get_sequences(num_sequences)
 
+    seq_start = cfg.get("_seq_start", 0)
+    seq_end = cfg.get("_seq_end", len(eval_sequences))
+    eval_sequences = eval_sequences[seq_start:seq_end]
+    num_sequences = len(eval_sequences)
+    logger.info(f"Evaluating sequences [{seq_start}:{seq_end}] → {num_sequences} sequences")
+
     # Set up output directory
     eval_dir = cfg.get("video_out_path", "data/calvin/videos_wp")
     os.makedirs(eval_dir, exist_ok=True)
@@ -481,11 +487,15 @@ def evaluate(cfg):
         seq_secs = time.time() - t_seq
 
         # Log running metrics
+        n_done = len(results)
         success_rates = count_success(results)
         avg_seq_len = np.mean(results)
-        sr_str = " | ".join(f"{i+1}/5: {sr:.1%}" for i, sr in enumerate(success_rates))
+        sr_str = " | ".join(
+            f"{i+1}/5: {sr:.1%}({sum(r >= i+1 for r in results)}/{n_done})"
+            for i, sr in enumerate(success_rates)
+        )
         logger.info(
-            f"  -> {result}/5 subtasks ({seq_secs:.1f}s) | "
+            f"  -> {result}/5 subtasks ({seq_secs:.1f}s) [{n_done}/{num_sequences}] | "
             f"avg_seq_len: {avg_seq_len:.2f} | {sr_str}"
         )
 
@@ -493,16 +503,18 @@ def evaluate(cfg):
     avg_seq_len = np.mean(results)
     chain_sr = count_success(results)
 
+    n_done = len(results)
     logger.info(f"\n{'='*60}")
-    logger.info(f"CALVIN Evaluation Results ({num_sequences} sequences)")
+    logger.info(f"CALVIN Evaluation Results ({n_done} sequences)")
     logger.info(f"Average successful sequence length: {avg_seq_len:.3f}")
     logger.info("Chain success rates:")
     for i, sr in enumerate(chain_sr):
-        logger.info(f"  {i+1}/5: {sr:.1%}")
+        n_succ = sum(r >= i + 1 for r in results)
+        logger.info(f"  {i+1}/5: {sr:.1%} ({n_succ}/{n_done})")
     logger.info(f"Total eval time: {time.time() - t_total:.1f}s")
 
     # Save results to JSON
-    results_path = os.path.join(eval_dir, "eval_results.json")
+    results_path = cfg.get("_results_file", os.path.join(eval_dir, "eval_results.json"))
     results_data = {
         "avg_seq_len": float(avg_seq_len),
         "chain_sr": {str(i+1): float(sr) for i, sr in enumerate(chain_sr)},
@@ -520,10 +532,20 @@ def main():
     logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--seq-start", type=int, default=None, help="Start index of sequences (inclusive)")
+    parser.add_argument("--seq-end", type=int, default=None, help="End index of sequences (exclusive)")
+    parser.add_argument("--results-file", type=str, default=None, help="Path to save JSON results")
     args = parser.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+
+    if args.seq_start is not None:
+        cfg["_seq_start"] = args.seq_start
+    if args.seq_end is not None:
+        cfg["_seq_end"] = args.seq_end
+    if args.results_file is not None:
+        cfg["_results_file"] = args.results_file
 
     evaluate(cfg)
 
