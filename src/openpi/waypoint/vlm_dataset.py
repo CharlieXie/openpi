@@ -242,15 +242,20 @@ class WaypointVLMDataset(IterableDataset):
 
     def __iter__(self):
         buffer = []
+        logged_fill = False
         for sample in self._raw_sample_iter():
             buffer.append(sample)
             if len(buffer) < self.shuffle_buffer_size:
-                if len(buffer) >= min(32, self.shuffle_buffer_size):
-                    idx = np.random.randint(len(buffer))
-                    yield buffer.pop(idx)
-            else:
-                idx = np.random.randint(len(buffer))
-                yield buffer.pop(idx)
+                if not logged_fill and len(buffer) == 1:
+                    logger.info(
+                        f"VLM shuffle buffer filling: target={self.shuffle_buffer_size} samples"
+                    )
+                continue
+            if not logged_fill:
+                logger.info(f"VLM shuffle buffer full ({len(buffer)} samples), training starts")
+                logged_fill = True
+            idx = np.random.randint(len(buffer))
+            yield buffer.pop(idx)
 
 
 class WaypointVLMCollator:

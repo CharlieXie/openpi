@@ -40,6 +40,21 @@ from train_waypoint import (
 )
 
 
+def multistep_lr(step, warmup, peak_lr, milestones, gamma):
+    """Piecewise-constant LR with linear warmup (VLA-Adapter style).
+
+    Warmup: linear from 10% to 100% of peak_lr over ``warmup`` steps.
+    Then flat at peak_lr, dropping by ``gamma`` at each milestone.
+    """
+    if step < warmup:
+        return peak_lr * (0.1 + 0.9 * step / max(warmup, 1))
+    lr = peak_lr
+    for m in milestones:
+        if step >= m:
+            lr *= gamma
+    return lr
+
+
 class _PrefetchIter:
     """Background-thread prefetcher for a DataLoader.
 
@@ -210,19 +225,36 @@ def train_joint(cfg, device, use_ddp, is_main):
     #     global_step = load_latest_checkpoint(model, optimizer, save_dir, device)
 
     # --- LR schedule ---
+    lr_schedule = cfg.get("lr_schedule", "cosine")
     warmup = cfg.get("warmup_steps", 100)
     peak_lr = cfg.get("peak_lr", 3e-5)
-    decay_steps = cfg.get("num_train_steps", 5000)
-    end_lr = cfg.get("end_lr", 1e-7)
     num_steps = cfg.get("num_train_steps", 5000)
     log_interval = cfg.get("log_interval", 5)
     ae_loss_weight = cfg.get("ae_loss_weight", 1.0)
     gradient_strategy = cfg.get("gradient_strategy", "none")
     gradient_scale = cfg.get("gradient_scale", 0.1)
 
+    # Schedule-specific params
+    end_lr = cfg.get("end_lr", 1e-7)
+    lr_decay_gamma = cfg.get("lr_decay_gamma", 0.1)
+    raw_milestones = cfg.get("lr_milestones", None)
+    if raw_milestones is not None:
+        lr_milestones = sorted(raw_milestones)
+    else:
+        decay_steps = cfg.get("num_steps_before_decay", num_steps)
+        lr_milestones = sorted(decay_steps) if isinstance(decay_steps, list) else [decay_steps]
+
     if is_main:
-        init_lr = peak_lr / (warmup + 1)
-        logging.info(f"LR schedule: init={init_lr:.2e} -> peak={peak_lr:.2e} (warmup {warmup} steps) -> end={end_lr:.2e} (cosine over {decay_steps} steps)")
+        if lr_schedule == "multistep":
+            final_lr = peak_lr * (lr_decay_gamma ** len(lr_milestones))
+            logging.info(
+                f"LR schedule: multistep | warmup(10%→100%)={warmup} steps | "
+                f"peak={peak_lr:.2e} | decay ×{lr_decay_gamma} at steps {lr_milestones} "
+                f"→ {final_lr:.2e}"
+            )
+        else:
+            init_lr = peak_lr / (warmup + 1)
+            logging.info(f"LR schedule: cosine | init={init_lr:.2e} -> peak={peak_lr:.2e} (warmup {warmup}) -> end={end_lr:.2e} (over {num_steps} steps)")
         logging.info(f"Training: {global_step} -> {num_steps} steps  |  save every {save_interval}  |  log every {log_interval}")
         logging.info(f"Gradient strategy: {gradient_strategy}  |  AE loss weight: {ae_loss_weight}  |  Gradient scale: {gradient_scale}")
 
@@ -269,8 +301,12 @@ def train_joint(cfg, device, use_ddp, is_main):
 
     for global_step in range(global_step, num_steps):
         # LR update
+        if lr_schedule == "multistep":
+            cur_lr = multistep_lr(global_step, warmup, peak_lr, lr_milestones, lr_decay_gamma)
+        else:
+            cur_lr = cosine_lr(global_step, warmup, peak_lr, num_steps, end_lr)
         for pg in optimizer.param_groups:
-            pg["lr"] = cosine_lr(global_step, warmup, peak_lr, decay_steps, end_lr)
+            pg["lr"] = cur_lr
 
         # --- Get batches ---
         if use_prefetch:

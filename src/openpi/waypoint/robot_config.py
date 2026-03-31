@@ -222,8 +222,8 @@ def make_calvin_config() -> RobotConfig:
         actual_action_dim=7,
         actual_proprio_dim=15,  # CALVIN robot_obs is 15D
         continuous_proprio_dim=6,  # dims 0-5 (TCP pos + euler)
-        gripper_dim_index=6,  # gripper width (meters, 0~0.08)
-        gripper_threshold=0.04,  # > 0.04m → open
+        gripper_dim_index=14,  # binary gripper state (-1=close, +1=open)
+        gripper_threshold=0.0,  # > 0 → open
         action_dim_indices=action_dims,
         state_obs_keys=["state"],
         camera_views=["primary", "wrist"],

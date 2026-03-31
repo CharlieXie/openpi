@@ -43,9 +43,11 @@ ae_batch_size: 192
 
 # Training hyperparameters
 num_train_steps: 1000
+lr_schedule: multistep
 warmup_steps: 40
 peak_lr: 5.0e-5
-end_lr: 1.0e-7
+num_steps_before_decay: 800
+lr_decay_gamma: 0.1
 
 # Normalization
 norm_type: q99
@@ -61,9 +63,10 @@ image_aug_cfg:
   saturation: [0.8, 1.2]
   hue: 0.05
 
-# Shuffle buffers
-vlm_shuffle_buffer_size: 5000
-ae_shuffle_buffer_size: 1000
+# Shuffle buffers (LIBERO-10 has ~12.5K samples; cover entire dataset for global shuffle)
+vlm_shuffle_buffer_size: 10000
+ae_shuffle_buffer_size: 10000
+episode_shuffle_buffer_size: 500
 
 # Logging and checkpointing
 exp_name: waypoint_joint_libero_10_sg_0.1_t2

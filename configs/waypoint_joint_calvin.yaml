@@ -30,11 +30,11 @@ vlm_max_token_len: 256
 stride: 1
 
 # Pretrained weights (Pi0.5 base)
-pretrained_weight_path: /projects/chuanlia001ssd/repos/pi_train/checkpoints/waypoint_joint_calvin_sg_0.4_t1/1600
+pretrained_weight_path: /projects/chuanlia001ssd/repos/pi_train/checkpoints/waypoint_joint_calvin_sg_0.3_t1/200
 
 # --- Joint training ---
 gradient_strategy: scale_gradient       # "none" | "stop_gradient" | "scale_gradient" | "freeze_backbone"
-gradient_scale: 0.4                     # only used when gradient_strategy=scale_gradient (fraction of AE gradient flowing into backbone K/V)
+gradient_scale: 0.3                     # only used when gradient_strategy=scale_gradient (fraction of AE gradient flowing into backbone K/V)
 ae_loss_weight: 1.0
 
 # Batch sizes (per GPU)
@@ -43,9 +43,11 @@ ae_batch_size: 192
 
 # Training hyperparameters
 num_train_steps: 2400
+lr_schedule: multistep
 warmup_steps: 40
-peak_lr: 3.41e-5
-end_lr: 5.0e-7
+peak_lr: 4.0e-5
+num_steps_before_decay: [300, 600, 900, 1200, 1500, 1800, 2100, 2400]
+lr_decay_gamma: 0.5
 
 # Normalization
 norm_type: q99
@@ -61,12 +63,14 @@ image_aug_cfg:
   saturation: [0.8, 1.2]
   hue: 0.05
 
-# Shuffle buffers (Calvin ~10x larger than LIBERO: ~171K VLM samples, ~153K AE pairs)
-vlm_shuffle_buffer_size: 20000
-ae_shuffle_buffer_size: 5000
+# Shuffle buffers (Calvin: ~153K VLM samples, ~153K AE pairs, 17870 episodes)
+# Reduced from 20K to 10K to avoid CPU RAM OOM on shared nodes (pro6000-4 has 387 GiB shared across 4 GPUs)
+vlm_shuffle_buffer_size: 5000
+ae_shuffle_buffer_size: 1000
+episode_shuffle_buffer_size: 0
 
 # Logging and checkpointing
-exp_name: waypoint_joint_calvin_sg_0.4_t1
+exp_name: waypoint_joint_calvin_sg_0.3_t2
 checkpoint_dir: checkpoints/{exp_name}
 save_interval: 200
 log_interval: 4
