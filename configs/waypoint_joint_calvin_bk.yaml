@@ -29,8 +29,8 @@ num_waypoints: 7
 vlm_max_token_len: 256
 stride: 1
 
-# Pretrained weights — resume from step-600 checkpoint
-pretrained_weight_path: /projects/chuanlia001ssd/repos/pi_train/checkpoints/waypoint_joint_calvin_sg_0.2_tt1/600
+# Pretrained weights (Pi0.5 base)
+pretrained_weight_path: /projects/chuanlia001ssd/models/pi05_base_pytorch
 
 # --- Joint training ---
 gradient_strategy: scale_gradient       # "none" | "stop_gradient" | "scale_gradient" | "freeze_backbone"
@@ -41,13 +41,17 @@ ae_loss_weight: 1.0
 vlm_batch_size: 192
 ae_batch_size: 192
 
-# Training hyperparameters (resumed from step 600, 4000-600=3400 remaining)
-num_train_steps: 3400
+# Training hyperparameters
+num_train_steps: 4000
 lr_schedule: multistep
+# warmup_steps: 40
+# peak_lr: 4.0e-5
+# num_steps_before_decay: [300, 600, 900, 1200, 1500, 1800, 2100, 2400]
+# lr_decay_gamma: 0.5
 
 peak_lr: 2.0e-4
-warmup_steps: 0
-num_steps_before_decay: [300, 1200, 2100, 3000]
+warmup_steps: 100
+num_steps_before_decay:  [900, 1800, 2700, 3600]
 lr_decay_gamma: 0.3
 
 # Normalization
@@ -66,12 +70,12 @@ image_aug_cfg:
 
 # Shuffle buffers (Calvin: ~153K VLM samples, ~153K AE pairs, 17870 episodes)
 # Reduced from 20K to 10K to avoid CPU RAM OOM on shared nodes (pro6000-4 has 387 GiB shared across 4 GPUs)
-vlm_shuffle_buffer_size: 12000
+vlm_shuffle_buffer_size: 15000
 ae_shuffle_buffer_size: 1000
 episode_shuffle_buffer_size: 2000
 
 # Logging and checkpointing
-exp_name: waypoint_joint_calvin_sg_0.2_tt2
+exp_name: waypoint_joint_calvin_sg_0.2_tt1
 checkpoint_dir: checkpoints/{exp_name}
 save_interval: 200
 log_interval: 4

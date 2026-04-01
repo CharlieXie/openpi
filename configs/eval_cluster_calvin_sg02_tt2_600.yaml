@@ -1,0 +1,41 @@
+# Waypoint Joint VLA evaluation config — CALVIN (ABC_D) — NTU Cluster
+# Usage: python -m openpi.waypoint.eval_calvin --config configs/eval_cluster_calvin.yaml
+
+robot_type: calvin
+
+# Joint model checkpoint (shared backbone)
+joint_checkpoint: /projects/chuanlia001ssd/repos/pi_train/checkpoints/waypoint_joint_calvin_sg_0.2_tt2/600
+
+# Data / normalization
+dataset_statistics_path: /projects/chuanlia001ssd/data/train/dataset_statistics.json
+
+# Model dimensions
+model_action_dim: 32
+model_proprio_dim: 32
+horizon_steps: 32
+num_waypoints: 7
+vlm_max_token_len: 256
+ae_max_token_len: 64
+
+# Model architecture
+paligemma_variant: gemma_2b
+action_expert_variant: gemma_300m
+precision: bfloat16
+
+# Normalization
+norm_type: q99
+
+# Inference optimization
+torch_compile: true
+
+# Center crop — inference equivalent of training's RandomResizedCrop.
+center_crop: true
+center_crop_scale: 0.9
+
+# CALVIN eval settings
+calvin_dataset_path: /projects/chuanlia001/calvin_dataset/task_ABC_D
+num_sequences: 500
+ep_len: 360
+
+# Video output
+video_out_path: /projects/chuanlia001ssd/repos/pi_train/data/calvin/videos_wp_joint_sg02_tt2_600
