@@ -15,6 +15,7 @@ import contextlib
 import logging
 import os
 import queue
+import signal
 import threading
 import time
 from pathlib import Path
@@ -33,6 +34,7 @@ from train_waypoint import (
     count_params,
     init_logging,
     init_wandb,
+    load_latest_checkpoint,
     log_gpu_info,
     log_gpu_memory,
     save_checkpoint,
@@ -174,8 +176,8 @@ def train_joint(cfg, device, use_ddp, is_main):
     if is_main:
         log_gpu_memory(device, prefix="[After model init] ")
 
-    # --- Load pretrained weights ---
-    if cfg.get("pretrained_weight_path"):
+    # --- Load pretrained weights (skip when resuming from checkpoint) ---
+    if cfg.get("pretrained_weight_path") and not cfg.get("resume", False):
         weight_path = os.path.join(cfg["pretrained_weight_path"], "model.safetensors")
         logging.info(f"Loading pretrained weights from {weight_path}")
         PI0WaypointJoint.load_pretrained_weights(model, weight_path, device)
@@ -220,9 +222,37 @@ def train_joint(cfg, device, use_ddp, is_main):
     save_interval = cfg.get("save_interval", 500)
 
     global_step = 0
-    # NOTE: resume not fully implemented yet (need to save/load optimizer state)
-    # if cfg.get("resume", False):
-    #     global_step = load_latest_checkpoint(model, optimizer, save_dir, device)
+    if cfg.get("resume", False):
+        global_step = load_latest_checkpoint(model, optimizer, save_dir, device)
+        if is_main:
+            log_gpu_memory(device, prefix="[After resume] ")
+
+    # --- SIGUSR1 force-save handler ---
+    _save_state = {
+        "model": model, "optimizer": optimizer,
+        "save_dir": save_dir, "step": global_step + 1,
+        "is_main": is_main, "save_interval": save_interval,
+    }
+
+    def _sigusr1_save(signum, _frame):
+        if not _save_state["is_main"]:
+            return
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            save_checkpoint(
+                _save_state["model"], _save_state["optimizer"],
+                _save_state["step"], _save_state["save_dir"],
+                _save_state["is_main"], _save_state["save_interval"],
+                force=True,
+            )
+            logging.info(f"[SIGUSR1] Force-saved checkpoint at step {_save_state['step']}")
+        except Exception as exc:
+            logging.error(f"[SIGUSR1] Save failed: {exc}")
+
+    signal.signal(signal.SIGUSR1, _sigusr1_save)
+    if is_main:
+        logging.info(f"SIGUSR1 handler registered — `kill -SIGUSR1 {os.getpid()}` to force-save")
 
     # --- LR schedule ---
     lr_schedule = cfg.get("lr_schedule", "cosine")
@@ -397,7 +427,15 @@ def train_joint(cfg, device, use_ddp, is_main):
             start_time = time.time()
 
         step_for_save = global_step + 1
+        _save_state["step"] = step_for_save
         save_checkpoint(model, optimizer, step_for_save, save_dir, is_main, save_interval)
+
+        trigger_file = save_dir / "SAVE_NOW"
+        if is_main and trigger_file.exists():
+            save_checkpoint(model, optimizer, step_for_save, save_dir, is_main, save_interval, force=True)
+            trigger_file.unlink(missing_ok=True)
+            logging.info(f"[TRIGGER] Force-saved checkpoint at step {step_for_save}")
+
         if pbar:
             pbar.update(1)
             pbar.set_postfix(

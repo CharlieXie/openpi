@@ -71,8 +71,10 @@ def cleanup_ddp():
         dist.destroy_process_group()
 
 
-def save_checkpoint(model, optimizer, step, save_dir, is_main, save_interval):
-    if not is_main or step % save_interval != 0:
+def save_checkpoint(model, optimizer, step, save_dir, is_main, save_interval, force=False):
+    if not is_main:
+        return
+    if not force and step % save_interval != 0:
         return
     final_dir = save_dir / f"{step}"
     tmp_dir = save_dir / f"tmp_{step}"
@@ -82,7 +84,7 @@ def save_checkpoint(model, optimizer, step, save_dir, is_main, save_interval):
 
     model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
     safetensors.torch.save_model(model_to_save, tmp_dir / "model.safetensors")
-    # torch.save(optimizer.state_dict(), tmp_dir / "optimizer.pt")
+    torch.save(optimizer.state_dict(), tmp_dir / "optimizer.pt")
     torch.save({"global_step": step, "timestamp": time.time()}, tmp_dir / "metadata.pt")
 
     if final_dir.exists():
@@ -99,7 +101,11 @@ def load_latest_checkpoint(model, optimizer, save_dir, device):
     ckpt = save_dir / str(latest)
     model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
     safetensors.torch.load_model(model_to_load, ckpt / "model.safetensors", device=str(device))
-    optimizer.load_state_dict(torch.load(ckpt / "optimizer.pt", map_location=device, weights_only=False))
+    opt_path = ckpt / "optimizer.pt"
+    if opt_path.exists():
+        optimizer.load_state_dict(torch.load(opt_path, map_location=device, weights_only=False))
+    else:
+        logging.warning(f"No optimizer state found at {opt_path}, starting with fresh optimizer state")
     meta = torch.load(ckpt / "metadata.pt", map_location=device, weights_only=False)
     logging.info(f"Resumed from step {meta['global_step']}")
     return meta["global_step"]

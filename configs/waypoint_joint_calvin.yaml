@@ -5,12 +5,12 @@ robot_type: calvin
 
 # --- Data paths ---
 # AE data
-original_rlds_dir: /projects/chuanlia001ssd/data/train/calvin_abc_rlds
-wp_indices_path: /projects/chuanlia001ssd/data/train/calvin_abc_wp_0_02/waypoint_indices.json
+original_rlds_dir: /workspace/data/calvin/train/calvin_abc_rlds
+wp_indices_path: /workspace/data/calvin/train/calvin_abc_wp_0_02/waypoint_indices.json
 # VLM data
-wp_rlds_dir: /projects/chuanlia001ssd/data/train/calvin_abc_wp_0_02/calvin_abc_wp/1.0.0
+wp_rlds_dir: /workspace/data/calvin/train/calvin_abc_wp_0_02/calvin_abc_wp/1.0.0
 # Shared
-dataset_statistics_path: /projects/chuanlia001ssd/data/train/dataset_statistics.json
+dataset_statistics_path: /workspace/data/calvin/train/dataset_statistics.json
 
 # --- Model architecture ---
 paligemma_variant: gemma_2b

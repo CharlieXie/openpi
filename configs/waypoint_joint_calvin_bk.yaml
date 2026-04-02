@@ -5,12 +5,12 @@ robot_type: calvin
 
 # --- Data paths ---
 # AE data
-original_rlds_dir: /projects/chuanlia001ssd/data/train/calvin_abc_rlds
-wp_indices_path: /projects/chuanlia001ssd/data/train/calvin_abc_wp_0_02/waypoint_indices.json
+original_rlds_dir: /workspace/data/calvin/train/calvin_abc_rlds
+wp_indices_path: /workspace/data/calvin/calvin_abc_wp_0_01/waypoint_indices.json
 # VLM data
-wp_rlds_dir: /projects/chuanlia001ssd/data/train/calvin_abc_wp_0_02/calvin_abc_wp/1.0.0
+wp_rlds_dir: /workspace/data/calvin/calvin_abc_wp_0_01/calvin_abc_wp/1.0.0
 # Shared
-dataset_statistics_path: /projects/chuanlia001ssd/data/train/dataset_statistics.json
+dataset_statistics_path: /workspace/data/calvin/train/dataset_statistics.json
 
 # --- Model architecture ---
 paligemma_variant: gemma_2b
@@ -30,7 +30,7 @@ vlm_max_token_len: 256
 stride: 1
 
 # Pretrained weights (Pi0.5 base)
-pretrained_weight_path: /projects/chuanlia001ssd/models/pi05_base_pytorch
+pretrained_weight_path: /workspace/model/pi05_base_pytorch
 
 # --- Joint training ---
 gradient_strategy: scale_gradient       # "none" | "stop_gradient" | "scale_gradient" | "freeze_backbone"
@@ -51,7 +51,7 @@ lr_schedule: multistep
 
 peak_lr: 2.0e-4
 warmup_steps: 100
-num_steps_before_decay:  [900, 1800, 2700, 3600]
+num_steps_before_decay:  [2200, 3000, 3600]
 lr_decay_gamma: 0.3
 
 # Normalization
@@ -71,11 +71,11 @@ image_aug_cfg:
 # Shuffle buffers (Calvin: ~153K VLM samples, ~153K AE pairs, 17870 episodes)
 # Reduced from 20K to 10K to avoid CPU RAM OOM on shared nodes (pro6000-4 has 387 GiB shared across 4 GPUs)
 vlm_shuffle_buffer_size: 15000
-ae_shuffle_buffer_size: 1000
+ae_shuffle_buffer_size: 5000
 episode_shuffle_buffer_size: 2000
 
 # Logging and checkpointing
-exp_name: waypoint_joint_calvin_sg_0.2_tt1
+exp_name: waypoint_joint_calvin_sg_0.2_wp001
 checkpoint_dir: checkpoints/{exp_name}
 save_interval: 200
 log_interval: 4
