@@ -309,7 +309,13 @@ def run_calvin_subtask(
                 if done:
                     break
 
-            start_wp = end_wp.copy()
+            # Use actual robot observation instead of VLM-predicted end_wp
+            # to prevent error accumulation across waypoint pairs.
+            actual_proprio = get_proprio_from_obs_calvin(obs)
+            actual_cont, actual_grip = rc.split_proprio(actual_proprio)
+            actual_cont_norm = norm_helper.normalize_proprio(actual_cont)
+            start_wp_7d = np.concatenate([actual_cont_norm, [float(actual_grip)]])
+            start_wp = pad_to_dim(start_wp_7d, model_proprio_dim)
 
         if steps_this_cycle == 0 and not done:
             logger.warning(f"  [replan {replan_count}] no actions executed, advancing with no-op")
