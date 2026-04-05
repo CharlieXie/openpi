@@ -4,7 +4,7 @@
 robot_type: calvin
 
 # Joint model checkpoint (shared backbone)
-joint_checkpoint: /projects/chuanlia001/checkpoints/waypoint_joint_calvin_sg_0.3_wp001/4000_loss0.0574
+joint_checkpoint: /projects/chuanlia001/checkpoints/waypoint_joint_calvin_sg_0.3_wp001/3000_loss0.0750
 
 # Data / normalization
 dataset_statistics_path: /projects/chuanlia001ssd/data/train/dataset_statistics.json

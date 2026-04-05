@@ -72,7 +72,7 @@ episode_shuffle_buffer_size: 2000
 
 # Logging and checkpointing
 exp_name: waypoint_joint_calvin_sg_0.2_tt2
-checkpoint_dir: checkpoints/{exp_name}
+checkpoint_dir: /projects/chuanlia001/checkpoints/{exp_name}
 save_interval: 200
 log_interval: 4
 wandb_enabled: true

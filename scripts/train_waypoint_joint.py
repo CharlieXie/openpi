@@ -226,6 +226,7 @@ def train_joint(cfg, device, use_ddp, is_main):
         global_step = load_latest_checkpoint(model, optimizer, save_dir, device)
         if is_main:
             log_gpu_memory(device, prefix="[After resume] ")
+            logging.info(f"Resumed training from step {global_step}")
 
     # --- SIGUSR1 force-save handler ---
     _save_state = {
@@ -428,14 +429,14 @@ def train_joint(cfg, device, use_ddp, is_main):
 
         step_for_save = global_step + 1
         _save_state["step"] = step_for_save
-        save_checkpoint(model, optimizer, step_for_save, save_dir, is_main, save_interval)
+        total_loss = vlm_loss.item() + ae_loss_weight * ae_loss.item()
+        save_checkpoint(model, optimizer, step_for_save, save_dir, is_main, save_interval, loss=total_loss)
 
         trigger_file = save_dir / "SAVE_NOW"
         if is_main and trigger_file.exists():
-            save_checkpoint(model, optimizer, step_for_save, save_dir, is_main, save_interval, force=True)
+            save_checkpoint(model, optimizer, step_for_save, save_dir, is_main, save_interval, loss=total_loss, force=True)
             trigger_file.unlink(missing_ok=True)
             logging.info(f"[TRIGGER] Force-saved checkpoint at step {step_for_save}")
-
         if pbar:
             pbar.update(1)
             pbar.set_postfix(

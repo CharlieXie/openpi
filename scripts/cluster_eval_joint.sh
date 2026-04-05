@@ -1,11 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=eval-joint
-#SBATCH --gpus=6000ada:2
+#SBATCH --gpus=pro6000:2
 #SBATCH --time=3-00:00:00
 #SBATCH --output=/projects/chuanlia001ssd/repos/pi_train/logs/eval_%x-%j.out
 #SBATCH --error=/projects/chuanlia001ssd/repos/pi_train/logs/eval_%x-%j.err
 
 CONFIG="${1:-configs/eval_waypoint_joint_libero.yaml}"
+EVAL_SUBDIR="${2:-eval_libero}"
 
 PIDIR="/projects/chuanlia001ssd/repos/pi_train"
 ENVDIR="/home/chuanlia001/envs/openpi"
@@ -18,13 +19,26 @@ if [ ! -f "$CONFIG" ]; then
     exit 1
 fi
 
-mkdir -p logs data/libero
+CHECKPOINT=$(grep '^joint_checkpoint:' "$CONFIG" | awk '{print $2}')
+if [ -z "$CHECKPOINT" ]; then
+    echo "ERROR: joint_checkpoint not found in $CONFIG"
+    exit 1
+fi
+
+EVAL_DIR="$CHECKPOINT/$EVAL_SUBDIR"
+EVAL_VIDEOS="$EVAL_DIR/videos"
+mkdir -p "$EVAL_DIR" "$EVAL_VIDEOS" logs
+
+RUNTIME_CONFIG="$EVAL_DIR/eval_config_${SLURM_JOB_ID}.yaml"
+sed "s|^video_out_path:.*|video_out_path: $EVAL_VIDEOS|" "$CONFIG" > "$RUNTIME_CONFIG"
 
 echo "=== Job Info ==="
 echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $SLURM_NODELIST"
 echo "GPUs: $(nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null)"
 echo "Config: $CONFIG"
+echo "Checkpoint: $CHECKPOINT"
+echo "Eval output dir: $EVAL_DIR"
 echo "Date: $(date)"
 echo "================"
 
@@ -35,25 +49,23 @@ export TORCHINDUCTOR_CACHE_DIR="$PIDIR/.torch_cache"
 export PYTHONPATH="$PIDIR/src:$PIDIR/third_party/libero:${PYTHONPATH:-}"
 export PYTHONFAULTHANDLER=1
 
-# Derive a short run name from the config's video_out_path for readable log filenames
-RUN_NAME=$(${PYTHON} -c "import yaml; c=yaml.safe_load(open('$CONFIG')); v=c.get('video_out_path','eval'); print(v.replace('data/libero/','').replace('videos_',''))" 2>/dev/null || echo "eval")
-
-RESULTS_GPU0="logs/${RUN_NAME}_results_gpu0_${SLURM_JOB_ID}.json"
-RESULTS_GPU1="logs/${RUN_NAME}_results_gpu1_${SLURM_JOB_ID}.json"
+RESULTS_GPU0="$EVAL_DIR/results_gpu0_${SLURM_JOB_ID}.json"
+RESULTS_GPU1="$EVAL_DIR/results_gpu1_${SLURM_JOB_ID}.json"
+LOG_GPU0="$EVAL_DIR/eval_gpu0_${SLURM_JOB_ID}.log"
+LOG_GPU1="$EVAL_DIR/eval_gpu1_${SLURM_JOB_ID}.log"
 
 echo "=== Launching 2 GPU processes: tasks 0-4 on GPU 0, tasks 5-9 on GPU 1 ==="
-echo "Run name: $RUN_NAME"
 
 CUDA_VISIBLE_DEVICES=0 $PYTHON -u -m openpi.waypoint.eval_libero \
-    --config "$CONFIG" --task-start 0 --task-end 5 \
+    --config "$RUNTIME_CONFIG" --task-start 0 --task-end 5 \
     --results-file "$RESULTS_GPU0" \
-    > logs/${RUN_NAME}_gpu0_${SLURM_JOB_ID}.log 2>&1 &
+    > "$LOG_GPU0" 2>&1 &
 PID0=$!
 
 CUDA_VISIBLE_DEVICES=1 $PYTHON -u -m openpi.waypoint.eval_libero \
-    --config "$CONFIG" --task-start 5 --task-end 10 \
+    --config "$RUNTIME_CONFIG" --task-start 5 --task-end 10 \
     --results-file "$RESULTS_GPU1" \
-    > logs/${RUN_NAME}_gpu1_${SLURM_JOB_ID}.log 2>&1 &
+    > "$LOG_GPU1" 2>&1 &
 PID1=$!
 
 echo "GPU 0 PID: $PID0 (tasks 0-4)"
@@ -68,6 +80,8 @@ echo ""
 echo "GPU 0 exit code: $EXIT0"
 echo "GPU 1 exit code: $EXIT1"
 echo ""
+
+MERGED_FILE="$EVAL_DIR/results_merged_${SLURM_JOB_ID}.json"
 
 $PYTHON -c "
 import json, sys
@@ -96,7 +110,7 @@ for name, r in merged.items():
     print(f\"  {name}: {r['success_rate']:.2%} ({r['successes']}/{r['trials']})\")
 print('=' * 60)
 
-out = 'logs/${RUN_NAME}_merged_${SLURM_JOB_ID}.json'
+out = '$MERGED_FILE'
 with open(out, 'w') as fh:
     json.dump({'overall': {'success_rate': overall_rate, 'successes': total_success, 'trials': total_trials}, 'tasks': merged}, fh, indent=2)
 print(f'Merged results saved to {out}')

@@ -19,13 +19,26 @@ if [ ! -f "$CONFIG" ]; then
     exit 1
 fi
 
-mkdir -p logs data/calvin
+CHECKPOINT=$(grep '^joint_checkpoint:' "$CONFIG" | awk '{print $2}')
+if [ -z "$CHECKPOINT" ]; then
+    echo "ERROR: joint_checkpoint not found in $CONFIG"
+    exit 1
+fi
+
+EVAL_DIR="$CHECKPOINT/eval_calvin"
+EVAL_VIDEOS="$EVAL_DIR/videos"
+mkdir -p "$EVAL_DIR" "$EVAL_VIDEOS" logs
+
+RUNTIME_CONFIG="$EVAL_DIR/eval_config_${SLURM_JOB_ID}.yaml"
+sed "s|^video_out_path:.*|video_out_path: $EVAL_VIDEOS|" "$CONFIG" > "$RUNTIME_CONFIG"
 
 echo "=== Job Info ==="
 echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $SLURM_NODELIST"
 echo "GPUs: $(nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null)"
 echo "Config: $CONFIG"
+echo "Checkpoint: $CHECKPOINT"
+echo "Eval output dir: $EVAL_DIR"
 echo "Date: $(date)"
 echo "================"
 
@@ -38,21 +51,23 @@ export PYTHONFAULTHANDLER=1
 export NUMBA_DISABLE_JIT=1
 export CALVIN_ROOT="$CALVIN"
 
-RESULTS_GPU0="logs/eval_calvin_results_gpu0_${SLURM_JOB_ID}.json"
-RESULTS_GPU1="logs/eval_calvin_results_gpu1_${SLURM_JOB_ID}.json"
+RESULTS_GPU0="$EVAL_DIR/results_gpu0_${SLURM_JOB_ID}.json"
+RESULTS_GPU1="$EVAL_DIR/results_gpu1_${SLURM_JOB_ID}.json"
+LOG_GPU0="$EVAL_DIR/eval_gpu0_${SLURM_JOB_ID}.log"
+LOG_GPU1="$EVAL_DIR/eval_gpu1_${SLURM_JOB_ID}.log"
 
 echo "=== Launching 2 GPU processes: seq 0-249 on GPU 0, seq 250-499 on GPU 1 ==="
 
 CUDA_VISIBLE_DEVICES=0 $PYTHON -u -m openpi.waypoint.eval_calvin \
-    --config "$CONFIG" --seq-start 0 --seq-end 250 \
+    --config "$RUNTIME_CONFIG" --seq-start 0 --seq-end 250 \
     --results-file "$RESULTS_GPU0" \
-    > logs/eval_calvin_gpu0_${SLURM_JOB_ID}.log 2>&1 &
+    > "$LOG_GPU0" 2>&1 &
 PID0=$!
 
 CUDA_VISIBLE_DEVICES=1 $PYTHON -u -m openpi.waypoint.eval_calvin \
-    --config "$CONFIG" --seq-start 250 --seq-end 500 \
+    --config "$RUNTIME_CONFIG" --seq-start 250 --seq-end 500 \
     --results-file "$RESULTS_GPU1" \
-    > logs/eval_calvin_gpu1_${SLURM_JOB_ID}.log 2>&1 &
+    > "$LOG_GPU1" 2>&1 &
 PID1=$!
 
 echo "GPU 0 PID: $PID0 (seq 0-249)"
@@ -68,7 +83,8 @@ echo "GPU 0 exit: $EXIT0"
 echo "GPU 1 exit: $EXIT1"
 echo ""
 
-# Merge results
+MERGED_FILE="$EVAL_DIR/results_merged_${SLURM_JOB_ID}.json"
+
 $PYTHON -c "
 import json, sys, numpy as np
 
@@ -99,7 +115,7 @@ for i in range(1, 6):
     print(f'  {i}/5: {s/n:.1%} ({s}/{n})')
 print('=' * 60)
 
-out = 'logs/eval_calvin_merged_${SLURM_JOB_ID}.json'
+out = '$MERGED_FILE'
 merged = {
     'avg_seq_len': float(avg),
     'chain_sr': {str(i): float(sum(r >= i for r in all_results)/n) for i in range(1,6)},

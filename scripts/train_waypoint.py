@@ -71,13 +71,14 @@ def cleanup_ddp():
         dist.destroy_process_group()
 
 
-def save_checkpoint(model, optimizer, step, save_dir, is_main, save_interval, force=False):
+def save_checkpoint(model, optimizer, step, save_dir, is_main, save_interval, loss=None, force=False):
     if not is_main:
         return
     if not force and step % save_interval != 0:
         return
-    final_dir = save_dir / f"{step}"
-    tmp_dir = save_dir / f"tmp_{step}"
+    tag = f"{step}" if loss is None else f"{step}_loss{loss:.4f}"
+    final_dir = save_dir / tag
+    tmp_dir = save_dir / f"tmp_{tag}"
     if tmp_dir.exists():
         shutil.rmtree(tmp_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -93,21 +94,37 @@ def save_checkpoint(model, optimizer, step, save_dir, is_main, save_interval, fo
     logging.info(f"Saved checkpoint step {step} -> {final_dir}")
 
 
+def _parse_ckpt_step(dirname):
+    """Extract step number from checkpoint dir name (e.g. '500' or '500_loss0.1234')."""
+    try:
+        return int(dirname.split("_")[0])
+    except (ValueError, IndexError):
+        return None
+
+
 def load_latest_checkpoint(model, optimizer, save_dir, device):
-    steps = [int(d.name) for d in save_dir.iterdir() if d.is_dir() and d.name.isdigit()]
-    if not steps:
+    candidates = []
+    for d in save_dir.iterdir():
+        if not d.is_dir() or d.name.startswith("tmp_"):
+            continue
+        if not (d / "metadata.pt").exists():
+            continue
+        step = _parse_ckpt_step(d.name)
+        if step is not None:
+            candidates.append((step, d))
+    if not candidates:
         return 0
-    latest = max(steps)
-    ckpt = save_dir / str(latest)
+    latest_step, ckpt = max(candidates, key=lambda x: x[0])
     model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
     safetensors.torch.load_model(model_to_load, ckpt / "model.safetensors", device=str(device))
     opt_path = ckpt / "optimizer.pt"
     if opt_path.exists():
         optimizer.load_state_dict(torch.load(opt_path, map_location=device, weights_only=False))
+        logging.info(f"Loaded optimizer state from {opt_path}")
     else:
-        logging.warning(f"No optimizer state found at {opt_path}, starting with fresh optimizer state")
+        logging.warning(f"No optimizer.pt found in {ckpt}, optimizer state not restored")
     meta = torch.load(ckpt / "metadata.pt", map_location=device, weights_only=False)
-    logging.info(f"Resumed from step {meta['global_step']}")
+    logging.info(f"Resumed from step {meta['global_step']} (dir: {ckpt.name})")
     return meta["global_step"]
 
 
@@ -361,7 +378,7 @@ def train_ae(cfg, device, use_ddp, is_main):
             start_time = time.time()
 
         global_step += 1
-        save_checkpoint(model, optimizer, global_step, save_dir, is_main, save_interval)
+        save_checkpoint(model, optimizer, global_step, save_dir, is_main, save_interval, loss=loss.item())
         if pbar:
             pbar.update(1)
             pbar.set_postfix(loss=f"{loss.item():.4f}", step=global_step)
@@ -558,7 +575,7 @@ def train_vlm(cfg, device, use_ddp, is_main):
             start_time = time.time()
 
         global_step += 1
-        save_checkpoint(model, optimizer, global_step, save_dir, is_main, save_interval)
+        save_checkpoint(model, optimizer, global_step, save_dir, is_main, save_interval, loss=loss.item())
         if pbar:
             pbar.update(1)
             pbar.set_postfix(loss=f"{loss.item():.4f}", step=global_step)

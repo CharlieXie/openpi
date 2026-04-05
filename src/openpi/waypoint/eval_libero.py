@@ -337,6 +337,8 @@ def load_joint(cfg, device):
 
     ckpt_path = cfg["joint_checkpoint"]
     ckpt_file = os.path.join(ckpt_path, "model.safetensors")
+    if not os.path.exists(ckpt_file):
+        ckpt_file = os.path.join(ckpt_path, "model_merged.safetensors")
     logger.info(f"Loading joint model from {ckpt_path}")
     t0 = time.time()
     PI0WaypointJoint.load_pretrained_weights(model, ckpt_file, "cpu")
@@ -499,6 +501,8 @@ def run_episode(
     max_steps = MAX_STEPS_MAP.get(cfg.get("task_suite", "libero_object"), 280)
     num_steps_wait = cfg.get("num_steps_wait", 10)
     crop_scale = cfg.get("center_crop_scale") if cfg.get("center_crop", False) else None
+    max_segments_per_replan = cfg.get("max_segments_per_replan", 0)
+    use_actual_proprio = cfg.get("use_actual_proprio", False)
 
     t = 0
     done = False
@@ -565,7 +569,8 @@ def run_episode(
 
         max_dur = cfg.get("horizon_steps", 32)
         for wp_idx, (proprio_values, duration) in enumerate(waypoints):
-            # proprio_values is 7D: [6D continuous_norm, 1D gripper_binary]
+            if max_segments_per_replan > 0 and wp_idx >= max_segments_per_replan:
+                break
             if duration == 0:
                 break
             if done:
@@ -625,13 +630,14 @@ def run_episode(
                 if done:
                     break
 
-            # Use actual robot observation instead of VLM-predicted end_wp
-            # to prevent error accumulation across waypoint pairs.
-            actual_proprio = get_proprio_from_obs(obs)
-            actual_cont, actual_grip = rc.split_proprio(actual_proprio)
-            actual_cont_norm = norm_helper.normalize_proprio(actual_cont)
-            start_wp_7d = np.concatenate([actual_cont_norm, [float(actual_grip)]])
-            start_wp = pad_to_dim(start_wp_7d, model_proprio_dim)
+            if use_actual_proprio:
+                actual_proprio = get_proprio_from_obs(obs)
+                actual_cont, actual_grip = rc.split_proprio(actual_proprio)
+                actual_cont_norm = norm_helper.normalize_proprio(actual_cont)
+                start_wp_7d = np.concatenate([actual_cont_norm, [float(actual_grip)]])
+                start_wp = pad_to_dim(start_wp_7d, model_proprio_dim)
+            else:
+                start_wp = end_wp.copy()
 
         if steps_this_cycle == 0 and not done:
             logger.warning(f"  [replan {replan_count}] no actions executed, advancing with no-op")
