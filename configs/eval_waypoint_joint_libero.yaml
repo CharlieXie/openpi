@@ -44,11 +44,16 @@ center_crop_scale: 0.9
 num_trials_per_task: 3
 num_steps_wait: 10
 
+# Reproducibility: fixed seed for deterministic flow matching noise.
+# Per-trial seed = eval_seed + task_idx * 1000 + trial.
+# Remove or set to null for non-deterministic evaluation.
+eval_seed: 42
+
 # Closed-loop improvements (eval-only, no retraining needed)
 # max_segments_per_replan: execute only N waypoint segments before replanning
 #   with fresh observation. 0 = execute all 7 (original behavior).
 #   Recommended: 3 (replan every ~18 steps instead of ~42).
-max_segments_per_replan: 3
+max_segments_per_replan: 0
 # use_actual_proprio: use the actual robot proprioception as start_wp for
 #   the next AE segment, instead of the VLM-predicted end_wp.
 #   Prevents error accumulation between consecutive waypoint pairs.

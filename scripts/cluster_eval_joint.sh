@@ -48,6 +48,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TORCHINDUCTOR_CACHE_DIR="$PIDIR/.torch_cache"
 export PYTHONPATH="$PIDIR/src:$PIDIR/third_party/libero:${PYTHONPATH:-}"
 export PYTHONFAULTHANDLER=1
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 RESULTS_GPU0="$EVAL_DIR/results_gpu0_${SLURM_JOB_ID}.json"
 RESULTS_GPU1="$EVAL_DIR/results_gpu1_${SLURM_JOB_ID}.json"

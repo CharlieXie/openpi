@@ -37,6 +37,19 @@ try:
 except Exception:
     pass
 
+class _NumpyEncoder(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, (np.integer,)):
+            return int(o)
+        if isinstance(o, (np.floating,)):
+            return float(o)
+        if isinstance(o, (np.bool_,)):
+            return bool(o)
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+        return super().default(o)
+
+
 from openpi.waypoint.normalize import (
     NormalizationHelper,
     load_dataset_statistics,
@@ -491,6 +504,7 @@ def run_episode(
     Returns:
         success: bool
         replay_images: list of uint8 numpy images for video recording
+        diagnostics: dict with structured per-segment tracking data
     """
     env.reset()
     obs = env.set_init_state(initial_state)
@@ -510,12 +524,16 @@ def run_episode(
     replay_images = []
     replan_count = 0
 
+    diag_replans = []
+
     dummy_action = np.zeros(7)
     while t < num_steps_wait:
         obs, _, done, _ = env.step(dummy_action)
         t += 1
         if done:
-            return True, replay_images
+            diagnostics = {"task": task_desc, "success": True, "total_steps": t,
+                           "replans": 0, "segments": [], "replans_detail": []}
+            return True, replay_images, diagnostics
 
     while t < max_steps + num_steps_wait and not done:
         agentview = obs.get("agentview_image", obs.get("agentview_rgb"))
@@ -537,7 +555,6 @@ def run_episode(
 
         images = get_libero_images(env, obs, center_crop_scale=crop_scale)
         proprio_raw = get_proprio_from_obs(obs)
-        # Split into continuous + binary gripper
         continuous_raw, gripper_binary = rc.split_proprio(proprio_raw)
         continuous_norm = norm_helper.normalize_proprio(continuous_raw)
 
@@ -555,14 +572,25 @@ def run_episode(
 
         valid_wps = [(p, d) for p, d in waypoints if d > 0]
         durations = [d for _, d in valid_wps]
+
+        replan_entry = {
+            "replan_idx": replan_count,
+            "step_t": t,
+            "vlm_time_ms": round(vlm_ms, 1),
+            "actual_state_norm": continuous_norm.tolist(),
+            "actual_gripper": int(gripper_binary),
+            "waypoints": [{"proprio": pv.tolist(), "duration": int(dur)} for pv, dur in waypoints],
+            "segments": [],
+        }
+
         logger.info(
             f"  [replan {replan_count}] VLM: {len(waypoints)} waypoints, "
             f"{len(valid_wps)} valid, durations={durations}, vlm_time={vlm_ms:.0f}ms"
         )
         for wi, (pv, dur) in enumerate(waypoints):
-            logger.info(f"    wp[{wi}]: proprio={_fmt_array(pv, 6)}, duration={dur}")
+            grip_tok = "open" if pv[6] > 0.5 else "close" if len(pv) > 6 else "?"
+            logger.info(f"    wp[{wi}]: proprio={_fmt_array(pv, 7)}, grip={grip_tok}, duration={dur}")
 
-        # Build 7D start_wp: [continuous_norm(6D), gripper_binary(1D)]
         start_wp_7d = np.concatenate([continuous_norm, [float(gripper_binary)]])
         start_wp = pad_to_dim(start_wp_7d, model_proprio_dim)
         steps_this_cycle = 0
@@ -582,6 +610,10 @@ def run_episode(
                 logger.warning(f"    wp[{wp_idx}]: duration {duration} exceeds max {max_dur}, clamping")
                 duration = max_dur
 
+            actual_start_proprio = get_proprio_from_obs(obs)
+            actual_start_cont, actual_start_grip = rc.split_proprio(actual_start_proprio)
+            actual_start_cont_norm = norm_helper.normalize_proprio(actual_start_cont)
+
             end_wp = pad_to_dim(proprio_values, model_proprio_dim)
 
             fresh_images = get_libero_images(env, obs, center_crop_scale=crop_scale)
@@ -592,11 +624,8 @@ def run_episode(
             ae_ms = (time.time() - t_ae) * 1000
 
             num_execute = min(int(duration), actions_norm.shape[0])
-            logger.info(
-                f"    ae[{wp_idx}]: shape={actions_norm.shape}, execute={num_execute}, "
-                f"range=[{actions_norm.min():.3f}, {actions_norm.max():.3f}], ae_time={ae_ms:.0f}ms"
-            )
 
+            gripper_actions_raw = []
             for step_i in range(num_execute):
                 action_raw = norm_helper.unnormalize_actions(actions_norm[step_i, :actual_action_dim])
 
@@ -605,6 +634,7 @@ def run_episode(
                 gripper = np.sign(gripper)
                 gripper = -gripper
                 action_raw[-1] = gripper
+                gripper_actions_raw.append(float(gripper))
 
                 obs, reward, done, info = env.step(action_raw)
                 t += 1
@@ -613,9 +643,9 @@ def run_episode(
                 agentview = obs.get("agentview_image", obs.get("agentview_rgb"))
                 if agentview is not None:
                     head_frame = np.ascontiguousarray(agentview[::-1, ::-1])
-                    wrist_raw = obs.get("robot0_eye_in_hand_image", obs.get("robot0_eye_in_hand_rgb"))
-                    if wrist_raw is not None:
-                        wrist_frame = np.ascontiguousarray(wrist_raw[::-1, ::-1])
+                    wrist_raw_img = obs.get("robot0_eye_in_hand_image", obs.get("robot0_eye_in_hand_rgb"))
+                    if wrist_raw_img is not None:
+                        wrist_frame = np.ascontiguousarray(wrist_raw_img[::-1, ::-1])
                         if wrist_frame.shape[0] != head_frame.shape[0]:
                             from PIL import Image as PILImage
                             wrist_frame = np.array(
@@ -630,6 +660,57 @@ def run_episode(
                 if done:
                     break
 
+            actual_end_proprio = get_proprio_from_obs(obs)
+            actual_end_cont, actual_end_grip = rc.split_proprio(actual_end_proprio)
+            actual_end_cont_norm = norm_helper.normalize_proprio(actual_end_cont)
+
+            predicted_end_7d = proprio_values[:7] if len(proprio_values) >= 7 else proprio_values
+            actual_end_7d = np.concatenate([actual_end_cont_norm, [float(actual_end_grip)]])
+            tracking_err = actual_end_7d - predicted_end_7d[:len(actual_end_7d)]
+            tracking_err_l2 = float(np.linalg.norm(tracking_err[:6]))
+            grip_match = int(actual_end_grip) == int(predicted_end_7d[6] > 0.5) if len(predicted_end_7d) > 6 else None
+
+            seg_diag = {
+                "replan": replan_count,
+                "wp_idx": wp_idx,
+                "duration": int(duration),
+                "steps_executed": num_execute,
+                "step_t_start": t - num_execute,
+                "step_t_end": t,
+                "ae_time_ms": round(ae_ms, 1),
+                "ae_start_wp": start_wp[:7].tolist(),
+                "ae_end_wp": proprio_values[:7].tolist() if len(proprio_values) >= 7 else proprio_values.tolist(),
+                "actual_start_cont_norm": actual_start_cont_norm.tolist(),
+                "actual_start_grip": int(actual_start_grip),
+                "actual_end_cont_norm": actual_end_cont_norm.tolist(),
+                "actual_end_grip": int(actual_end_grip),
+                "tracking_error_per_dim": tracking_err.tolist(),
+                "tracking_error_l2_pos": tracking_err_l2,
+                "gripper_match": grip_match,
+                "gripper_actions": gripper_actions_raw,
+                "action_range": [float(actions_norm.min()), float(actions_norm.max())],
+            }
+            replan_entry["segments"].append(seg_diag)
+
+            horizon_actions = []
+            for si in range(actions_norm.shape[0]):
+                a_unnorm = norm_helper.unnormalize_actions(actions_norm[si, :actual_action_dim])
+                horizon_actions.append(a_unnorm.copy())
+
+            logger.info(
+                f"    ae[{wp_idx}]: execute={num_execute}, duration={int(duration)}, horizon={actions_norm.shape[0]}, "
+                f"ae_time={ae_ms:.0f}ms, "
+                f"track_err_l2={tracking_err_l2:.4f}, "
+                f"err_per_dim={_fmt_array(tracking_err, 7)}, "
+                f"grip_pred={'open' if (len(predicted_end_7d) > 6 and predicted_end_7d[6] > 0.5) else 'close'}, "
+                f"grip_actual={'open' if actual_end_grip else 'close'}, "
+                f"grip_actions={gripper_actions_raw}"
+            )
+            # for si, a_step in enumerate(horizon_actions):
+            #     marker = "*" if si < num_execute else " "
+            #     vals = " ".join(f"{v:.4f}" for v in a_step[:7])
+            #     logger.info(f"      [{marker}] step {si:2d}: [{vals}]")
+
             if use_actual_proprio:
                 actual_proprio = get_proprio_from_obs(obs)
                 actual_cont, actual_grip = rc.split_proprio(actual_proprio)
@@ -639,22 +720,70 @@ def run_episode(
             else:
                 start_wp = end_wp.copy()
 
+        diag_replans.append(replan_entry)
+
         if steps_this_cycle == 0 and not done:
             logger.warning(f"  [replan {replan_count}] no actions executed, advancing with no-op")
             obs, reward, done, info = env.step(np.zeros(actual_action_dim))
             t += 1
 
-    logger.info(f"  episode done: steps={t}, replans={replan_count}, success={done and reward > 0}")
-    return done and reward > 0, replay_images
+    success = done and reward > 0
+
+    all_segments = [s for r in diag_replans for s in r["segments"]]
+    if all_segments:
+        all_track_l2 = [s["tracking_error_l2_pos"] for s in all_segments]
+        grip_matches = [s["gripper_match"] for s in all_segments if s["gripper_match"] is not None]
+        logger.info(
+            f"  episode done: steps={t}, replans={replan_count}, success={success}, "
+            f"segments={len(all_segments)}, "
+            f"track_err: mean={np.mean(all_track_l2):.4f} max={np.max(all_track_l2):.4f}, "
+            f"grip_accuracy={sum(grip_matches)}/{len(grip_matches)} "
+            f"({sum(grip_matches)/max(len(grip_matches),1):.0%})"
+        )
+    else:
+        logger.info(f"  episode done: steps={t}, replans={replan_count}, success={success}")
+
+    diagnostics = {
+        "task": task_desc,
+        "success": success,
+        "total_steps": t,
+        "replans": replan_count,
+        "total_segments": len(all_segments),
+        "tracking_error_l2_mean": float(np.mean([s["tracking_error_l2_pos"] for s in all_segments])) if all_segments else None,
+        "tracking_error_l2_max": float(np.max([s["tracking_error_l2_pos"] for s in all_segments])) if all_segments else None,
+        "gripper_accuracy": sum(grip_matches) / max(len(grip_matches), 1) if all_segments and grip_matches else None,
+        "replans_detail": diag_replans,
+    }
+
+    return success, replay_images, diagnostics
 
 
 # ---------------------------------------------------------------------------
 # Main evaluation
 # ---------------------------------------------------------------------------
 
+def set_eval_seed(seed: int):
+    """Set global random seed for reproducible evaluation."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    try:
+        torch.use_deterministic_algorithms(True)
+    except Exception:
+        pass
+
+
 def evaluate(cfg):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
+
+    eval_seed = cfg.get("eval_seed", None)
+    if eval_seed is not None:
+        set_eval_seed(eval_seed)
+        logger.info(f"Eval seed set to {eval_seed}")
 
     t_total = time.time()
     use_joint = "joint_checkpoint" in cfg
@@ -712,7 +841,12 @@ def evaluate(cfg):
     task_end = min(task_end, num_tasks)
     logger.info(f"Evaluating tasks [{task_start}, {task_end}) out of {num_tasks} total")
 
+    diag_out_path = video_out_path / "diagnostics"
+    diag_out_path.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Diagnostics will be saved to: {diag_out_path}")
+
     results = {}
+    all_episode_diags = []
     total_success = 0
     total_episodes = 0
 
@@ -736,20 +870,32 @@ def evaluate(cfg):
 
         successes = 0
         for trial in range(min(num_trials, len(initial_states))):
+            if eval_seed is not None:
+                trial_seed = eval_seed + task_idx * 1000 + trial
+                set_eval_seed(trial_seed)
             t_ep = time.time()
             logger.info(f"Task {task_idx}/{num_tasks}: {task_name} trial {trial}")
-            success, replay_images = run_episode(
+            success, replay_images, ep_diag = run_episode(
                 vlm, ae_model, wp_tokenizer, norm_helper,
                 env, initial_states[trial], task_desc, cfg, device, pg_tok,
             )
             ep_secs = time.time() - t_ep
+            ep_diag["task_idx"] = task_idx
+            ep_diag["trial"] = trial
+            ep_diag["wall_time_s"] = round(ep_secs, 1)
+            all_episode_diags.append(ep_diag)
+
+            task_segment = task_desc.replace(" ", "_")
+            diag_file = diag_out_path / f"diag_{task_segment}_t{trial}.json"
+            with open(diag_file, "w") as f:
+                json.dump(ep_diag, f, indent=2, cls=_NumpyEncoder)
+
             if success:
                 successes += 1
                 total_success += 1
             total_episodes += 1
 
             suffix = "success" if success else "failure"
-            task_segment = task_desc.replace(" ", "_")
             if replay_images:
                 video_file = video_out_path / f"rollout_{task_segment}_t{trial}_{suffix}.mp4"
                 imageio.mimwrite(
@@ -781,7 +927,35 @@ def evaluate(cfg):
     logger.info(f"Overall success rate: {overall_rate:.2%} ({total_success}/{total_episodes})")
     for name, r in results.items():
         logger.info(f"  {name}: {r['success_rate']:.2%} ({r['successes']}/{r['trials']})")
+
+    all_segs = [s for d in all_episode_diags for r in d.get("replans_detail", []) for s in r.get("segments", [])]
+    if all_segs:
+        all_l2 = [s["tracking_error_l2_pos"] for s in all_segs]
+        grip_m = [s["gripper_match"] for s in all_segs if s["gripper_match"] is not None]
+        success_segs = [s for d in all_episode_diags if d["success"] for r in d.get("replans_detail", []) for s in r.get("segments", [])]
+        fail_segs = [s for d in all_episode_diags if not d["success"] for r in d.get("replans_detail", []) for s in r.get("segments", [])]
+        success_l2 = [s["tracking_error_l2_pos"] for s in success_segs] if success_segs else []
+        fail_l2 = [s["tracking_error_l2_pos"] for s in fail_segs] if fail_segs else []
+
+        logger.info(f"\n{'='*60}")
+        logger.info(f"DIAGNOSTICS SUMMARY ({len(all_segs)} segments across {len(all_episode_diags)} episodes)")
+        logger.info(f"  Tracking error (L2, normalized proprio space):")
+        logger.info(f"    Overall:  mean={np.mean(all_l2):.4f}  std={np.std(all_l2):.4f}  max={np.max(all_l2):.4f}")
+        if success_l2:
+            logger.info(f"    Success:  mean={np.mean(success_l2):.4f}  std={np.std(success_l2):.4f}  max={np.max(success_l2):.4f}")
+        if fail_l2:
+            logger.info(f"    Failure:  mean={np.mean(fail_l2):.4f}  std={np.std(fail_l2):.4f}  max={np.max(fail_l2):.4f}")
+        if grip_m:
+            logger.info(f"  Gripper accuracy: {sum(grip_m)}/{len(grip_m)} ({sum(grip_m)/len(grip_m):.1%})")
+
+        per_dim_errs = np.array([s["tracking_error_per_dim"] for s in all_segs])
+        dim_labels = ["pos_x", "pos_y", "pos_z", "rot_1", "rot_2", "rot_3", "grip"]
+        logger.info(f"  Per-dim tracking error (mean abs):")
+        for d in range(min(per_dim_errs.shape[1], len(dim_labels))):
+            logger.info(f"    {dim_labels[d]:6s}: mean_abs={np.mean(np.abs(per_dim_errs[:, d])):.4f}  std={np.std(per_dim_errs[:, d]):.4f}")
+
     logger.info(f"Total eval time: {time.time() - t_total:.1f}s")
+    logger.info(f"Diagnostics saved to: {diag_out_path}")
 
     return results
 
@@ -807,7 +981,7 @@ def main():
 
     if args.results_file:
         with open(args.results_file, "w") as f:
-            json.dump(results, f, indent=2)
+            json.dump(results, f, indent=2, cls=_NumpyEncoder)
         logger.info(f"Results saved to {args.results_file}")
 
 

@@ -1,0 +1,37 @@
+# Waypoint Joint VLA evaluation config — LIBERO
+# max_segments_per_replan=2: replan every ~13 steps
+
+robot_type: libero
+task_suite: libero_10
+
+joint_checkpoint: /projects/chuanlia001/checkpoints/libero_10_lora/700_best
+
+dataset_statistics_path: /projects/chuanlia001ssd/data/libero/10/dataset_statistics.json
+
+model_action_dim: 32
+model_proprio_dim: 32
+horizon_steps: 32
+num_waypoints: 7
+vlm_max_token_len: 256
+ae_max_token_len: 64
+
+paligemma_variant: gemma_2b
+action_expert_variant: gemma_300m
+precision: bfloat16
+
+norm_type: q99
+
+torch_compile: true
+
+center_crop: true
+center_crop_scale: 0.9
+
+num_trials_per_task: 3
+num_steps_wait: 10
+
+eval_seed: 42
+
+max_segments_per_replan: 2
+use_actual_proprio: true
+
+video_out_path: data/libero/videos_wp_joint_libero_10_lora
