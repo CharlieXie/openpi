@@ -9,7 +9,7 @@ task_suite: libero_10
 
 # Joint model checkpoint (single checkpoint with shared backbone)
 # When "joint_checkpoint" is present, eval_libero auto-detects joint mode.
-joint_checkpoint: /projects/chuanlia001/checkpoints/libero_10_lora/700_best
+joint_checkpoint: /projects/chuanlia001/checkpoints/waypoint_joint_libero_10_v2/1200_loss0.0807
 
 # Data / normalization
 dataset_statistics_path: /projects/chuanlia001ssd/data/libero/10/dataset_statistics.json

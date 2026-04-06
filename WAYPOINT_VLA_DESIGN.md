@@ -1,6 +1,6 @@
 # Waypoint VLA — openpi 实现设计文档
 
-> 最后更新: 2026-03-27 (rev 10 — 新增 CALVIN ABC_D 支持)
+> 最后更新: 2026-04-05 (rev 11 — Duration Token + Gripper 改进 + AE Proprio Aug + 全局 Seed)
 > 基于 Pi0.5 (PyTorch) 在 openpi 项目中实现两段式 Waypoint VLA 系统。联合训练 (joint training) 为主要训练范式，独立 VLM/AE 训练仅作为参考。
 
 ---
@@ -1239,3 +1239,136 @@ PYTHONPATH=$PWD:$PYTHONPATH \
 2. **训练冒烟测试**: 运行 1 步联合训练确认无报错
 3. **评测冒烟测试**: 运行少量 sequences 确认 pipeline 端到端工作
 4. **完整训练 + 评测**: 训练 5000 步，使用 chain-task 协议评测
+
+---
+
+## 十八、Duration Token + Gripper 改进 + AE Proprio Aug + 全局 Seed (rev 11)
+
+### 动机
+
+LIBERO-10 评测结果 (76.7%, 23/30) 的诊断分析揭示了三个核心问题：
+
+1. **VLM gripper 预测不稳定**：82.6% 的 VLM 训练窗口无 gripper 转换，导致 VLM 学到"保持当前 gripper 不变"的强先验。62.8% 的 replan 预测全 open。
+2. **AE tracking 误差累积**：7-segment 开环执行中误差从 wp0=0.10 增长到 wp6=0.32，对长程任务影响显著。
+3. **Duration 条件化不够显式**：Duration 通过 sinusoidal embedding 与 time 合并为 AdaRMSNorm 条件，action tokens 无法直接 attend to duration 信息。
+
+### 修改内容
+
+#### 1. Duration 作为独立 Attention Token（架构变更）
+
+**旧 AE suffix 序列：**
+```
+[start_wp, end_wp, action_1, ..., action_32]
+                    ↑ adarms_cond = time + duration (合并)
+```
+
+**新 AE suffix 序列：**
+```
+[start_wp, end_wp, dur_token, action_1, ..., action_32]
+                               ↑ adarms_cond = time only
+```
+
+- `time_mlp_in`: `Linear(2W, W)` → `Linear(W, W)`，现在可直接加载 Pi0.5 base 权重
+- 新增 `duration_embed = nn.Embedding(34, W)`，离散查找表覆盖 duration 0-33
+- Duration token 放在 end_wp 之后、action tokens 之前，att_mask=0（bidirectional）
+- Action tokens 可通过 attention 直接读取 duration 信息
+
+**不兼容变更：旧 waypoint joint checkpoint 无法加载，需从 Pi0.5 base 重新训练**
+
+#### 2. VLM Gripper Token Loss 加权（可配置开关）
+
+在 `vlm_forward()` 中，对 gripper token 位置的 CE loss 乘以 `gripper_loss_weight` 倍权重：
+
+```python
+if self.gripper_loss_weight != 1.0:
+    per_token_loss = F.cross_entropy(active_logits, active_targets, reduction="none")
+    is_gripper = (active_targets == _GRIP_OPEN_ID) | (active_targets == _GRIP_CLOSE_ID)
+    weights = torch.where(is_gripper, self.gripper_loss_weight, 1.0)
+    loss = (per_token_loss * weights).sum() / weights.sum()
+```
+
+配置: `gripper_loss_weight: 3.0`（默认 1.0 = 关闭）
+
+#### 3. VLM Gripper 转换窗口过采样（可配置开关）
+
+在 `vlm_dataset.py` 的 `_raw_sample_iter()` 中，含有 gripper 状态变化的滑动窗口会被 yield 多次：
+
+```python
+has_grip_transition = np.any(wp_grippers[:actual_wps] != current_gripper)
+n_yield = gripper_oversample_factor if has_grip_transition else 1
+```
+
+配置: `gripper_oversample_factor: 3`（默认 1 = 关闭）
+
+#### 4. AE Proprio 噪声增强（可配置开关）
+
+在 `ae_dataset.py` 的 `_process_episode()` 中，给 start/end proprio 的连续维度加 Gaussian 噪声：
+
+```python
+if self.proprio_noise_std > 0:
+    start_7d[:cdim] = np.clip(start_7d[:cdim] + np.random.randn(cdim) * noise_std, -1, 1)
+    end_7d[:cdim] = np.clip(end_7d[:cdim] + np.random.randn(cdim) * noise_std, -1, 1)
+```
+
+- 仅影响连续维度 (dims 0-5)，gripper 维度 (dim 6) 不加噪
+- 噪声在归一化空间 [-1, 1] 中应用，0.02 对应约 3 个 VLM 300-bin 量化格
+
+配置: `ae_proprio_noise_std: 0.02`（默认 0.0 = 关闭）
+
+#### 5. 全局训练 Seed
+
+在 `train_waypoint_joint.py` 的 `train_joint()` 开头设置全局 seed：
+
+```python
+seed = cfg.get("seed", 42)
+random.seed(seed + rank)
+np.random.seed(seed + rank)
+torch.manual_seed(seed + rank)
+torch.cuda.manual_seed_all(seed + rank)
+```
+
+每个 DDP rank 使用 `seed + rank` 以保证不同 GPU 有不同的数据 shuffle。
+
+配置: `seed: 42`
+
+### 修改文件清单
+
+| 文件 | 修改内容 |
+|------|----------|
+| `joint_model.py` | `__init__`: 新增 `gripper_loss_weight`、`duration_embed`；`time_mlp_in` 改为 `Linear(W,W)`。`embed_suffix()`: duration 作为 token 插入序列，time-only AdaRMSNorm。`vlm_forward()`: gripper token 加权 CE loss。`load_pretrained_weights()`: docstring 更新 |
+| `vlm_dataset.py` | `__init__`: 新增 `gripper_oversample_factor`。`_raw_sample_iter()`: 含 gripper 转换的窗口过采样 |
+| `ae_dataset.py` | `__init__`: 新增 `proprio_noise_std`。`_process_episode()`: start/end proprio Gaussian 噪声增强 |
+| `train_waypoint_joint.py` | 新增 `import random`；`train_joint()` 开头设置全局 seed；传递新配置参数到 dataset 和 model |
+| `waypoint_joint_libero.yaml` | 新增 `gripper_loss_weight`, `gripper_oversample_factor`, `ae_proprio_noise_std`, `seed` |
+| `waypoint_joint_libero_v2.yaml` | 新建 — 使用 Pi0.5 base 权重 + LoRA + 所有 rev 11 优化 |
+
+### 不需要修改的文件
+
+- `eval_libero.py` — eval 时 `PI0WaypointJoint` 的 `gripper_loss_weight` 默认 1.0（关闭），duration token 通过 `embed_suffix` 自动生效
+- `eval_waypoint_joint_libero.yaml` — 只需更新 `joint_checkpoint` 路径指向新训练的 checkpoint
+- `tokenizer.py` — VLM token 格式不变
+- `ae_model.py` — legacy，不更新
+
+### 配置参数
+
+```yaml
+# rev 11 新增参数
+gripper_loss_weight: 3.0           # VLM CE loss 中 gripper token 的权重倍数 (1.0=关闭)
+gripper_oversample_factor: 3       # 含 gripper 转换的 VLM 训练窗口过采样倍数 (1=关闭)
+ae_proprio_noise_std: 0.02         # AE start/end proprio 连续维度的 Gaussian 噪声 std (0.0=关闭)
+seed: 42                          # 全局训练 seed (每个 DDP rank 加 rank offset)
+```
+
+### 训练命令
+
+```bash
+# 使用 cluster SLURM 提交
+sbatch scripts/cluster_train_joint.sh configs/waypoint_joint_libero_v2.yaml
+```
+
+### 验证清单
+
+1. 冒烟测试 1 步确认无报错 (特别注意 `time_mlp_in` 和 `duration_embed` 的权重加载日志)
+2. 确认 wandb 日志中 `vlm_loss` 正常下降（gripper loss 加权不应导致 loss 爆炸）
+3. 确认 AE loss 正常（proprio 噪声增强不应导致 AE 无法收敛）
+4. Eval 时检查 VLM 的 gripper 预测分布（对比 rev 10: 62.8% 全 open → 期望降低）

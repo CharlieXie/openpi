@@ -1,0 +1,95 @@
+# Waypoint Joint (VLM + AE) training config — LIBERO-10 v2
+# Changes from v1: duration token, gripper improvements, AE proprio aug, seed
+# Usage: sbatch scripts/cluster_train_joint.sh configs/waypoint_joint_libero_v2.yaml
+
+robot_type: libero
+
+# --- Data paths ---
+# AE data
+original_rlds_dir: /projects/chuanlia001ssd/data/libero/10/libero_10_no_noops/1.0.0
+wp_indices_path: /projects/chuanlia001ssd/data/libero/10/libero_10_wp_0006/waypoint_indices.json
+# VLM data
+wp_rlds_dir: /projects/chuanlia001ssd/data/libero/10/libero_10_wp_0006/waypoint_filtered_rlds__libero/1.0.0
+# Shared
+dataset_statistics_path: /projects/chuanlia001ssd/data/libero/10/dataset_statistics.json
+
+# --- Model architecture ---
+paligemma_variant: gemma_2b
+action_expert_variant: gemma_300m
+precision: bfloat16
+
+# Model dimensions (AE)
+model_action_dim: 32
+model_proprio_dim: 32
+horizon_steps: 32
+max_duration: 32
+ae_max_token_len: 64
+
+# Waypoint config (VLM)
+num_waypoints: 7
+vlm_max_token_len: 256
+stride: 1
+
+# Pretrained weights (Pi0.5 base — time_mlp_in now loads directly)
+pretrained_weight_path: /projects/chuanlia001ssd/models/pi05_base_pytorch
+
+# --- Joint training ---
+gradient_strategy: scale_gradient
+gradient_scale: 0.3
+ae_loss_weight: 1.0
+
+# VLM gripper prediction improvements (rev 11)
+gripper_loss_weight: 3.0                # CE loss weight multiplier for gripper tokens (1.0=disabled)
+gripper_oversample_factor: 3            # oversample VLM windows with gripper transitions (1=disabled)
+
+# AE proprio augmentation (rev 11)
+ae_proprio_noise_std: 0.02              # Gaussian noise std on start/end proprio continuous dims (0.0=disabled)
+
+# Reproducibility (rev 11)
+seed: 42
+
+# Batch sizes (per GPU)
+vlm_batch_size: 192
+ae_batch_size: 192
+
+# Training hyperparameters
+num_train_steps: 1200
+lr_schedule: multistep
+warmup_steps: 40
+peak_lr: 2.0e-4
+num_steps_before_decay: [600, 900, 1200]
+lr_decay_gamma: 0.3
+
+# Normalization
+norm_type: q99
+
+# Image augmentation
+image_aug: true
+image_aug_cfg:
+  random_resized_crop_scale: [0.9, 0.9]
+  brightness: 0.2
+  contrast: [0.8, 1.2]
+  saturation: [0.8, 1.2]
+  hue: 0.05
+
+# Shuffle buffers
+vlm_shuffle_buffer_size: 10000
+ae_shuffle_buffer_size: 10000
+episode_shuffle_buffer_size: 500
+
+# Logging and checkpointing
+exp_name: waypoint_joint_libero_10_v2
+checkpoint_dir: /projects/chuanlia001/checkpoints/{exp_name}
+save_interval: 200
+log_interval: 4
+wandb_enabled: true
+wandb_project: waypoint_e2e
+
+# LoRA
+lora_enabled: false
+lora_rank: 16
+lora_alpha: 16.0
+train_vision_encoder: true
+
+# Resume from checkpoint
+resume: true

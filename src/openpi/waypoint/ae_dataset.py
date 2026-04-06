@@ -56,6 +56,7 @@ class WaypointAEDataset(IterableDataset):
         episode_shuffle_buffer: int = 0,
         image_aug: bool = False,
         image_aug_cfg: dict | None = None,
+        proprio_noise_std: float = 0.0,
     ):
         super().__init__()
         self.original_rlds_dir = original_rlds_dir
@@ -68,6 +69,7 @@ class WaypointAEDataset(IterableDataset):
         self.shuffle_buffer_size = shuffle_buffer_size
         self.image_size = image_size
         self.episode_shuffle_buffer = episode_shuffle_buffer
+        self.proprio_noise_std = proprio_noise_std
 
         self.norm_helper = NormalizationHelper(dataset_statistics, norm_type)
 
@@ -160,6 +162,13 @@ class WaypointAEDataset(IterableDataset):
             end_cont_norm = self.norm_helper.normalize_proprio(end_cont)
             start_7d = np.concatenate([start_cont_norm, [float(start_grip)]])
             end_7d = np.concatenate([end_cont_norm, [float(end_grip)]])
+
+            if self.proprio_noise_std > 0:
+                cdim = rc.continuous_proprio_dim
+                start_7d[:cdim] = np.clip(
+                    start_7d[:cdim] + np.random.randn(cdim) * self.proprio_noise_std, -1, 1)
+                end_7d[:cdim] = np.clip(
+                    end_7d[:cdim] + np.random.randn(cdim) * self.proprio_noise_std, -1, 1)
 
             start_proprio = pad_to_dim(start_7d, self.model_proprio_dim)
             end_proprio = pad_to_dim(end_7d, self.model_proprio_dim)

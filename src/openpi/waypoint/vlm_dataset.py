@@ -74,6 +74,7 @@ class WaypointVLMDataset(IterableDataset):
         image_aug: bool = False,
         image_aug_cfg: dict | None = None,
         episode_shuffle_buffer: int = 0,
+        gripper_oversample_factor: int = 1,
     ):
         super().__init__()
         self.wp_rlds_dir = wp_rlds_dir
@@ -85,6 +86,7 @@ class WaypointVLMDataset(IterableDataset):
         self.image_size = image_size
         self.shuffle_buffer_size = shuffle_buffer_size
         self.episode_shuffle_buffer = episode_shuffle_buffer
+        self.gripper_oversample_factor = gripper_oversample_factor
 
         self.norm_helper = NormalizationHelper(dataset_statistics, norm_type)
 
@@ -96,7 +98,8 @@ class WaypointVLMDataset(IterableDataset):
         logger.info(
             f"WaypointVLMDataset: dir={wp_rlds_dir}, M={num_waypoints}, stride={stride}, "
             f"robot={robot_config.robot_type}, image_aug={image_aug}, "
-            f"episode_shuffle_buffer={episode_shuffle_buffer}"
+            f"episode_shuffle_buffer={episode_shuffle_buffer}, "
+            f"gripper_oversample_factor={gripper_oversample_factor}"
         )
 
     def _raw_sample_iter(self):
@@ -228,7 +231,7 @@ class WaypointVLMDataset(IterableDataset):
                         wp_pad_mask_duration=wp_pad_mask_duration,
                     )
 
-                    yield {
+                    sample = {
                         "images": images,
                         "image_masks": image_masks,
                         "tokens": tokens,
@@ -236,6 +239,14 @@ class WaypointVLMDataset(IterableDataset):
                         "ar_mask": ar_mask,
                         "loss_mask": loss_mask,
                     }
+
+                    has_grip_transition = (
+                        self.gripper_oversample_factor > 1
+                        and np.any(wp_grippers[:actual_wps] != current_gripper)
+                    )
+                    n_yield = self.gripper_oversample_factor if has_grip_transition else 1
+                    for _ in range(n_yield):
+                        yield sample
 
                 del steps, all_proprios_raw, all_proprios_continuous_norm
                 gc.collect()

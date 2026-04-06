@@ -59,6 +59,7 @@ class PI0WaypointJoint(nn.Module):
         gradient_strategy: str = "none",
         gradient_scale: float = 0.1,
         aug_cfg: dict | None = None,
+        gripper_loss_weight: float = 1.0,
     ):
         super().__init__()
         assert gradient_strategy in ("none", "stop_gradient", "scale_gradient", "freeze_backbone"), (
@@ -69,6 +70,7 @@ class PI0WaypointJoint(nn.Module):
         self.gradient_strategy = gradient_strategy
         self.gradient_scale = gradient_scale
         self.aug_cfg = aug_cfg
+        self.gripper_loss_weight = gripper_loss_weight
         self.action_horizon = config.action_horizon
         self.action_dim = config.action_dim
         self.duration_max = getattr(config, "duration_max", DURATION_MAX)
@@ -85,12 +87,13 @@ class PI0WaypointJoint(nn.Module):
             precision=config.dtype,
         )
 
-        # --- AE-specific projections (identical to ae_model.py) ---
+        # --- AE-specific projections ---
         self.action_in_proj = nn.Linear(self.action_dim, expert_width)
         self.action_out_proj = nn.Linear(expert_width, self.action_dim)
         self.proprio_encoder = nn.Linear(self.action_dim, expert_width)
-        self.time_mlp_in = nn.Linear(2 * expert_width, expert_width)
+        self.time_mlp_in = nn.Linear(expert_width, expert_width)
         self.time_mlp_out = nn.Linear(expert_width, expert_width)
+        self.duration_embed = nn.Embedding(DURATION_N_BINS, expert_width)
 
         self.gradient_checkpointing_enabled = False
 
@@ -174,7 +177,11 @@ class PI0WaypointJoint(nn.Module):
         return embs, pad_masks, att_masks
 
     def embed_suffix(self, start_proprio, end_proprio, noisy_actions, timestep, duration):
-        """Embed proprio conditioning + noisy actions + time/duration for expert."""
+        """Embed proprio conditioning + duration token + noisy actions for expert.
+
+        Suffix sequence: [start_wp, end_wp, dur_token, action_1, ..., action_H]
+        AdaRMSNorm conditioning uses time embedding only (no duration).
+        """
         embs, pad_masks, att_masks = [], [], []
         device = noisy_actions.device
         bsize = noisy_actions.shape[0]
@@ -187,18 +194,19 @@ class PI0WaypointJoint(nn.Module):
         pad_masks.append(torch.ones(bsize, 2, dtype=torch.bool, device=device))
         att_masks += [1, 0]
 
+        # Duration as a discrete token in the sequence
+        dur_int = duration.clamp(0, DURATION_MAX).long()
+        dur_tok = self.duration_embed(dur_int).unsqueeze(1)  # [B, 1, W]
+        dur_tok = dur_tok.to(proprio_emb.dtype)
+        embs.append(dur_tok)
+        pad_masks.append(torch.ones(bsize, 1, dtype=torch.bool, device=device))
+        att_masks += [0]
+
+        # Time-only AdaRMSNorm conditioning
         time_emb = create_sinusoidal_pos_embedding(
             timestep, expert_width, min_period=4e-3, max_period=4.0, device=device,
-        ).to(timestep.dtype)
-
-        dur_normalized = duration / self.duration_max
-        dur_emb = create_sinusoidal_pos_embedding(
-            dur_normalized, expert_width, min_period=4e-3, max_period=4.0, device=device,
-        ).to(timestep.dtype)
-
-        combined = torch.cat([time_emb, dur_emb], dim=-1)
-        combined = combined.to(self.time_mlp_in.weight.dtype)
-        x = self.time_mlp_in(combined)
+        ).to(self.time_mlp_in.weight.dtype)
+        x = self.time_mlp_in(time_emb)
         x = F.silu(x)
         x = self.time_mlp_out(x)
         adarms_cond = F.silu(x)
@@ -304,7 +312,14 @@ class PI0WaypointJoint(nn.Module):
             active_hidden = hidden[mask]
             active_targets = targets[mask]
             active_logits = F.linear(active_hidden.float(), lm_head_weight.float())
-            loss = F.cross_entropy(active_logits, active_targets)
+
+            if self.gripper_loss_weight != 1.0:
+                per_token_loss = F.cross_entropy(active_logits, active_targets, reduction="none")
+                is_gripper = (active_targets == _GRIP_OPEN_ID) | (active_targets == _GRIP_CLOSE_ID)
+                weights = torch.where(is_gripper, self.gripper_loss_weight, 1.0)
+                loss = (per_token_loss * weights).sum() / weights.sum()
+            else:
+                loss = F.cross_entropy(active_logits, active_targets)
         else:
             loss = torch.tensor(0.0, device=device, requires_grad=True)
 
@@ -703,8 +718,8 @@ class PI0WaypointJoint(nn.Module):
     def load_pretrained_weights(model, weight_path, device):
         """Load pretrained Pi0.5 weights with shape-mismatch tolerance.
 
-        Handles the time_mlp_in resize from [W,W] to [2W,W] and any other
-        shape differences gracefully.
+        ``time_mlp_in`` is now ``Linear(W, W)`` matching Pi0.5 base.
+        ``duration_embed`` is new and stays randomly initialized.
         """
         import safetensors.torch
 

@@ -37,6 +37,16 @@ gradient_strategy: scale_gradient       # "none" | "stop_gradient" | "scale_grad
 gradient_scale: 0.1                     # only used when gradient_strategy=scale_gradient (fraction of AE gradient flowing into backbone K/V)
 ae_loss_weight: 1.0
 
+# VLM gripper prediction improvements
+gripper_loss_weight: 3.0                # CE loss weight multiplier for gripper tokens (1.0=disabled)
+gripper_oversample_factor: 3            # oversample VLM windows with gripper transitions (1=disabled)
+
+# AE proprio augmentation
+ae_proprio_noise_std: 0.02              # Gaussian noise std on start/end proprio continuous dims (0.0=disabled)
+
+# Reproducibility
+seed: 42
+
 # Batch sizes (per GPU)
 vlm_batch_size: 192
 ae_batch_size: 192

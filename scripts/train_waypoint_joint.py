@@ -15,6 +15,7 @@ import contextlib
 import logging
 import os
 import queue
+import random
 import signal
 import threading
 import time
@@ -104,6 +105,16 @@ def train_joint(cfg, device, use_ddp, is_main):
     from openpi.waypoint.vlm_dataset import WaypointVLMCollator, WaypointVLMDataset
     import openpi.models.pi0_config as pi0_config
 
+    rank = dist.get_rank() if use_ddp and dist.is_initialized() else 0
+    seed = cfg.get("seed", 42)
+    random.seed(seed + rank)
+    np.random.seed(seed + rank)
+    torch.manual_seed(seed + rank)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed + rank)
+    if is_main:
+        logging.info(f"Global seed set to {seed} (rank offset → {seed + rank})")
+
     rc = get_robot_config(cfg["robot_type"])
     stats = load_dataset_statistics(cfg["dataset_statistics_path"])
 
@@ -127,6 +138,7 @@ def train_joint(cfg, device, use_ddp, is_main):
         image_aug=cfg.get("image_aug", False),
         image_aug_cfg=cfg.get("image_aug_cfg", None),
         episode_shuffle_buffer=cfg.get("episode_shuffle_buffer_size", 0),
+        gripper_oversample_factor=cfg.get("gripper_oversample_factor", 1),
     )
     vlm_collator = WaypointVLMCollator()
     vlm_loader = torch.utils.data.DataLoader(
@@ -148,6 +160,7 @@ def train_joint(cfg, device, use_ddp, is_main):
         episode_shuffle_buffer=cfg.get("episode_shuffle_buffer_size", 0),
         image_aug=cfg.get("image_aug", False),
         image_aug_cfg=cfg.get("image_aug_cfg", None),
+        proprio_noise_std=cfg.get("ae_proprio_noise_std", 0.0),
     )
     ae_collator = WaypointAECollator()
     ae_loader = torch.utils.data.DataLoader(
@@ -171,6 +184,7 @@ def train_joint(cfg, device, use_ddp, is_main):
         vlm_max_token_len=cfg.get("vlm_max_token_len", 256),
         gradient_strategy=cfg.get("gradient_strategy", "none"),
         gradient_scale=cfg.get("gradient_scale", 0.1),
+        gripper_loss_weight=cfg.get("gripper_loss_weight", 1.0),
     ).to(device)
     model.gradient_checkpointing_enable()
     if is_main:
