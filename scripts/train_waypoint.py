@@ -15,6 +15,7 @@ import argparse
 import gc
 import logging
 import os
+import random
 import shutil
 import time
 from pathlib import Path
@@ -49,6 +50,22 @@ def init_logging():
         logger.addHandler(ch)
     else:
         logger.handlers[0].setFormatter(formatter)
+
+
+def set_seed(seed: int, local_rank: int = 0):
+    """Set global random seed for reproducible training.
+
+    Each DDP rank gets ``seed + local_rank`` so that data shuffling differs
+    across GPUs while model initialization stays deterministic.
+    """
+    s = seed + local_rank
+    random.seed(s)
+    np.random.seed(s)
+    torch.manual_seed(s)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(s)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def setup_ddp():
@@ -694,6 +711,11 @@ def main():
 
     use_ddp, local_rank, device = setup_ddp()
     is_main = not use_ddp or dist.get_rank() == 0
+
+    seed = cfg.get("seed", 42)
+    set_seed(seed, local_rank)
+    if is_main:
+        logging.info(f"Global seed: {seed} (rank offset → {seed + local_rank})")
 
     if is_main:
         log_gpu_info(device)

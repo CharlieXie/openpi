@@ -19,6 +19,7 @@ import json
 import logging
 import math
 import pathlib
+import random
 import time
 from pathlib import Path
 
@@ -764,6 +765,7 @@ def run_episode(
 
 def set_eval_seed(seed: int):
     """Set global random seed for reproducible evaluation."""
+    random.seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
     if torch.cuda.is_available():

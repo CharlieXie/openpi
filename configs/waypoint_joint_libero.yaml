@@ -1,14 +1,15 @@
 # Waypoint Joint (VLM + AE) training config — LIBERO
 # Usage: torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_waypoint_joint.py --config configs/waypoint_joint_libero.yaml
 
+seed: 42
 robot_type: libero
 
 # --- Data paths ---
 # AE data
 original_rlds_dir: /projects/chuanlia001ssd/data/libero/10/libero_10_no_noops/1.0.0
-wp_indices_path: /projects/chuanlia001ssd/data/libero/10/libero_10_wp_001/waypoint_indices.json
+wp_indices_path: /projects/chuanlia001ssd/data/libero/10/libero_10_wp_0006/waypoint_indices.json
 # VLM data
-wp_rlds_dir: /projects/chuanlia001ssd/data/libero/10/libero_10_wp_001/waypoint_filtered_rlds__libero/1.0.0
+wp_rlds_dir: /projects/chuanlia001ssd/data/libero/10/libero_10_wp_0006/waypoint_filtered_rlds__libero/1.0.0
 # Shared
 dataset_statistics_path: /projects/chuanlia001ssd/data/libero/10/dataset_statistics.json
 
@@ -30,11 +31,11 @@ vlm_max_token_len: 256
 stride: 1
 
 # Pretrained weights (Pi0.5 base)
-pretrained_weight_path: /projects/chuanlia001ssd/repos/pi_train/checkpoints/waypoint_joint_libero_10_sg_0.1/1000
+pretrained_weight_path: /projects/chuanlia001ssd/models/pi05_base_pytorch
 
 # --- Joint training ---
 gradient_strategy: scale_gradient       # "none" | "stop_gradient" | "scale_gradient" | "freeze_backbone"
-gradient_scale: 0.1                     # only used when gradient_strategy=scale_gradient (fraction of AE gradient flowing into backbone K/V)
+gradient_scale: 0.3                     # only used when gradient_strategy=scale_gradient (fraction of AE gradient flowing into backbone K/V)
 ae_loss_weight: 1.0
 
 # Batch sizes (per GPU)
@@ -42,12 +43,12 @@ vlm_batch_size: 192
 ae_batch_size: 192
 
 # Training hyperparameters
-num_train_steps: 1000
+num_train_steps: 1200
 lr_schedule: multistep
 warmup_steps: 40
-peak_lr: 5.0e-5
-num_steps_before_decay: 800
-lr_decay_gamma: 0.1
+peak_lr: 2.0e-4
+num_steps_before_decay: [600, 900]
+lr_decay_gamma: 0.3
 
 # Normalization
 norm_type: q99
@@ -69,8 +70,8 @@ ae_shuffle_buffer_size: 10000
 episode_shuffle_buffer_size: 500
 
 # Logging and checkpointing
-exp_name: waypoint_joint_libero_10_sg_0.1_t2
-checkpoint_dir: checkpoints/{exp_name}
+exp_name: waypoint_joint_libero_10_sg_0.3_wp0006_base
+checkpoint_dir: /projects/chuanlia001/checkpoints/{exp_name}
 save_interval: 100
 log_interval: 3
 wandb_enabled: true
@@ -83,4 +84,4 @@ lora_alpha: 16.0
 train_vision_encoder: true
 
 # Resume from checkpoint
-resume: false
+resume: true

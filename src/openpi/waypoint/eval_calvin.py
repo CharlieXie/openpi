@@ -58,6 +58,7 @@ from openpi.waypoint.eval_libero import (
     predict_waypoints,
     predict_actions,
     center_crop_and_resize,
+    set_eval_seed,
 )
 
 logger = logging.getLogger(__name__)
@@ -402,6 +403,11 @@ def count_success(results):
 def evaluate(cfg):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
+
+    eval_seed = cfg.get("eval_seed", None)
+    if eval_seed is not None:
+        set_eval_seed(eval_seed)
+        logger.info(f"Eval seed set to {eval_seed}")
 
     t_total = time.time()
 

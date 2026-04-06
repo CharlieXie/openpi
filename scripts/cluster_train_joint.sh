@@ -37,6 +37,7 @@ export PYTHONPATH="$PIDIR/src:${PYTHONPATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export WANDB_API_KEY=$(grep password ~/.netrc | awk '{print $2}')
 export PYTHONFAULTHANDLER=1
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 NGPU=$(nvidia-smi -L 2>/dev/null | wc -l)
 

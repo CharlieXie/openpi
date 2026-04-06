@@ -38,6 +38,7 @@ from train_waypoint import (
     log_gpu_info,
     log_gpu_memory,
     save_checkpoint,
+    set_seed,
     setup_ddp,
 )
 
@@ -471,6 +472,11 @@ def main():
 
     use_ddp, local_rank, device = setup_ddp()
     is_main = not use_ddp or dist.get_rank() == 0
+
+    seed = cfg.get("seed", 42)
+    set_seed(seed, local_rank)
+    if is_main:
+        logging.info(f"Global seed: {seed} (rank offset → {seed + local_rank})")
 
     if is_main:
         log_gpu_info(device)
