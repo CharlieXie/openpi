@@ -9,7 +9,7 @@ task_suite: libero_10
 
 # Joint model checkpoint (single checkpoint with shared backbone)
 # When "joint_checkpoint" is present, eval_libero auto-detects joint mode.
-joint_checkpoint: /projects/chuanlia001/checkpoints/libero_10_lora/700_best
+joint_checkpoint: /projects/chuanlia001/checkpoints/waypoint_joint_libero_10_sg_0.3_wp0006_base/1200_loss0.0517
 
 # Data / normalization
 dataset_statistics_path: /projects/chuanlia001ssd/data/libero/10/dataset_statistics.json
@@ -41,7 +41,7 @@ center_crop: true
 center_crop_scale: 0.9
 
 # Evaluation
-num_trials_per_task: 3
+num_trials_per_task: 5
 num_steps_wait: 10
 
 # Reproducibility: fixed seed for deterministic flow matching noise.
@@ -60,4 +60,4 @@ max_segments_per_replan: 0
 use_actual_proprio: true
 
 # Video output
-video_out_path: data/libero/videos_wp_joint_libero_10_lora
+video_out_path: /projects/chuanlia001/checkpoints/waypoint_joint_libero_10_sg_0.3_wp0006_base/1200_loss0.0517/eval_libero/videos

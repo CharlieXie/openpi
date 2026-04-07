@@ -473,10 +473,14 @@ def main():
     use_ddp, local_rank, device = setup_ddp()
     is_main = not use_ddp or dist.get_rank() == 0
 
-    seed = cfg.get("seed", 42)
-    set_seed(seed, local_rank)
-    if is_main:
-        logging.info(f"Global seed: {seed} (rank offset → {seed + local_rank})")
+    seed = cfg.get("seed", None)
+    if seed is not None:
+        set_seed(seed, local_rank)
+        if is_main:
+            logging.info(f"Global seed: {seed} (rank offset → {seed + local_rank})")
+    else:
+        if is_main:
+            logging.info("No fixed seed — training is non-deterministic")
 
     if is_main:
         log_gpu_info(device)

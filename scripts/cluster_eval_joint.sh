@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=eval-joint
-#SBATCH --gpus=pro6000:2
+#SBATCH --gpus=a5000:2
+#SBATCH --nodelist=gpu-a5000-2
 #SBATCH --time=3-00:00:00
 #SBATCH --output=/projects/chuanlia001ssd/repos/pi_train/logs/eval_%x-%j.out
 #SBATCH --error=/projects/chuanlia001ssd/repos/pi_train/logs/eval_%x-%j.err
