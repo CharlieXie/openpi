@@ -6,12 +6,12 @@ robot_type: libero
 
 # --- Data paths ---
 # AE data
-original_rlds_dir: /workspace/data/libero_10_no_noops/1.0.0
-wp_indices_path: /workspace/data/libero_10_wp_0006/waypoint_indices.json
+original_rlds_dir: /projects/chuanlia001ssd/data/libero/10/libero_10_no_noops/1.0.0
+wp_indices_path: /projects/chuanlia001ssd/data/libero/10/libero_10_wp_0006/waypoint_indices.json
 # VLM data
-wp_rlds_dir: /workspace/data/libero_10_wp_0006/waypoint_filtered_rlds__libero/1.0.0
+wp_rlds_dir: /projects/chuanlia001ssd/data/libero/10/libero_10_wp_0006/waypoint_filtered_rlds__libero/1.0.0
 # Shared
-dataset_statistics_path: /workspace/data/dataset_statistics.json
+dataset_statistics_path: /projects/chuanlia001ssd/data/libero/10/dataset_statistics.json
 
 # --- Model architecture ---
 paligemma_variant: gemma_2b
@@ -31,7 +31,7 @@ vlm_max_token_len: 256
 stride: 1
 
 # Pretrained weights (Pi0.5 base)
-pretrained_weight_path: /workspace/model/pi05_base_pytorch
+pretrained_weight_path: /projects/chuanlia001ssd/models/pi05_base_pytorch
 
 # --- Joint training ---
 gradient_strategy: scale_gradient       # "none" | "stop_gradient" | "scale_gradient" | "freeze_backbone"

@@ -85,13 +85,12 @@ class PI0WaypointJoint(nn.Module):
             precision=config.dtype,
         )
 
-        # --- AE-specific projections ---
+        # --- AE-specific projections (identical to ae_model.py) ---
         self.action_in_proj = nn.Linear(self.action_dim, expert_width)
         self.action_out_proj = nn.Linear(expert_width, self.action_dim)
         self.proprio_encoder = nn.Linear(self.action_dim, expert_width)
-        self.time_mlp_in = nn.Linear(expert_width, expert_width)
+        self.time_mlp_in = nn.Linear(2 * expert_width, expert_width)
         self.time_mlp_out = nn.Linear(expert_width, expert_width)
-        self.duration_embed = nn.Embedding(DURATION_N_BINS, expert_width)
 
         self.gradient_checkpointing_enabled = False
 
@@ -175,11 +174,7 @@ class PI0WaypointJoint(nn.Module):
         return embs, pad_masks, att_masks
 
     def embed_suffix(self, start_proprio, end_proprio, noisy_actions, timestep, duration):
-        """Embed proprio conditioning + duration token + noisy actions for expert.
-
-        Suffix sequence: [start_wp, end_wp, dur_token, action_1, ..., action_H]
-        AdaRMSNorm conditioning uses time embedding only (no duration).
-        """
+        """Embed proprio conditioning + noisy actions + time/duration for expert."""
         embs, pad_masks, att_masks = [], [], []
         device = noisy_actions.device
         bsize = noisy_actions.shape[0]
@@ -192,17 +187,18 @@ class PI0WaypointJoint(nn.Module):
         pad_masks.append(torch.ones(bsize, 2, dtype=torch.bool, device=device))
         att_masks += [1, 0]
 
-        dur_int = duration.clamp(0, DURATION_MAX).long()
-        dur_tok = self.duration_embed(dur_int).unsqueeze(1)  # [B, 1, W]
-        dur_tok = dur_tok.to(proprio_emb.dtype)
-        embs.append(dur_tok)
-        pad_masks.append(torch.ones(bsize, 1, dtype=torch.bool, device=device))
-        att_masks += [0]
-
         time_emb = create_sinusoidal_pos_embedding(
             timestep, expert_width, min_period=4e-3, max_period=4.0, device=device,
-        ).to(self.time_mlp_in.weight.dtype)
-        x = self.time_mlp_in(time_emb)
+        ).to(timestep.dtype)
+
+        dur_normalized = duration / self.duration_max
+        dur_emb = create_sinusoidal_pos_embedding(
+            dur_normalized, expert_width, min_period=4e-3, max_period=4.0, device=device,
+        ).to(timestep.dtype)
+
+        combined = torch.cat([time_emb, dur_emb], dim=-1)
+        combined = combined.to(self.time_mlp_in.weight.dtype)
+        x = self.time_mlp_in(combined)
         x = F.silu(x)
         x = self.time_mlp_out(x)
         adarms_cond = F.silu(x)
@@ -707,8 +703,8 @@ class PI0WaypointJoint(nn.Module):
     def load_pretrained_weights(model, weight_path, device):
         """Load pretrained Pi0.5 weights with shape-mismatch tolerance.
 
-        ``time_mlp_in`` is now ``Linear(W, W)`` matching Pi0.5 base.
-        ``duration_embed`` is new and stays randomly initialized.
+        Handles the time_mlp_in resize from [W,W] to [2W,W] and any other
+        shape differences gracefully.
         """
         import safetensors.torch
 
