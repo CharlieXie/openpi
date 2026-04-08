@@ -260,23 +260,26 @@ class WaypointAEDataset(IterableDataset):
                     gc.collect()
 
     def __iter__(self):
-        """Yields shuffled samples via a reservoir-style buffer.
+        """Yields shuffled samples via a sliding-window buffer.
 
         Fill buffer up to shuffle_buffer_size, then for every new sample
         yield one random item from the buffer (keeps buffer size constant).
-        When raw iter exhausts an epoch, drain remaining buffer then restart.
         """
         buffer = []
+        logged_fill = False
         for sample in self._raw_sample_iter():
             buffer.append(sample)
             if len(buffer) < self.shuffle_buffer_size:
-                # Still filling; yield immediately to avoid stalling
-                if len(buffer) >= min(32, self.shuffle_buffer_size):
-                    idx = np.random.randint(len(buffer))
-                    yield buffer.pop(idx)
-            else:
-                idx = np.random.randint(len(buffer))
-                yield buffer.pop(idx)
+                if not logged_fill and len(buffer) == 1:
+                    logger.info(
+                        f"AE shuffle buffer filling: target={self.shuffle_buffer_size} samples"
+                    )
+                continue
+            if not logged_fill:
+                logger.info(f"AE shuffle buffer full ({len(buffer)} samples), training starts")
+                logged_fill = True
+            idx = np.random.randint(len(buffer))
+            yield buffer.pop(idx)
 
 
 class WaypointAECollator:
