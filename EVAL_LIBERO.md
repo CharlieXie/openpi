@@ -150,12 +150,89 @@ print(f'{sum(d==0 for d in diffs)}/{len(diffs)} exact, max_diff={max(diffs)}')
 | `torch.load` weights_only error | Script patches this automatically |
 | Missing `future`/`easydict`/`gym` | `uv pip install --python .venv/bin/python future easydict "gym==0.25.2"` |
 
-## Reference Results (pi0.5 official checkpoint)
+## Eval Results
 
-| Suite | Tasks | Success Rate |
-|-------|-------|-------------|
-| libero_spatial | 10 | 98.8% |
-| libero_object | 10 | 98.2% |
-| libero_goal | 10 | 98.0% |
-| libero_10 | 10 | 92.4% |
-| **Average** | | **96.85%** |
+### Our eval (pi0.5 JAX official checkpoint, 3 trials/task, seed=7, 2026-04-09)
+
+| Suite | Success | Rate | Failed Tasks |
+|-------|---------|------|--------------|
+| libero_spatial | 30/30 | **100.0%** | -- |
+| libero_object | 30/30 | **100.0%** | -- |
+| libero_goal | 29/30 | **96.7%** | open the middle drawer of the cabinet (2/3) |
+| libero_10 | 29/30 | **96.7%** | put both moka pots on the stove (2/3) |
+| **Average** | **118/120** | **98.3%** | |
+
+<details>
+<summary>Per-task breakdown (click to expand)</summary>
+
+**libero_spatial** (100.0%)
+
+| Task | Rate |
+|------|------|
+| pick up the black bowl between the plate and the ramekin and place it on the plate | 3/3 |
+| pick up the black bowl next to the ramekin and place it on the plate | 3/3 |
+| pick up the black bowl from table center and place it on the plate | 3/3 |
+| pick up the black bowl on the cookie box and place it on the plate | 3/3 |
+| pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate | 3/3 |
+| pick up the black bowl on the ramekin and place it on the plate | 3/3 |
+| pick up the black bowl next to the cookie box and place it on the plate | 3/3 |
+| pick up the black bowl on the stove and place it on the plate | 3/3 |
+| pick up the black bowl next to the plate and place it on the plate | 3/3 |
+| pick up the black bowl on the wooden cabinet and place it on the plate | 3/3 |
+
+**libero_object** (100.0%)
+
+| Task | Rate |
+|------|------|
+| pick up the alphabet soup and place it in the basket | 3/3 |
+| pick up the cream cheese and place it in the basket | 3/3 |
+| pick up the salad dressing and place it in the basket | 3/3 |
+| pick up the bbq sauce and place it in the basket | 3/3 |
+| pick up the ketchup and place it in the basket | 3/3 |
+| pick up the tomato sauce and place it in the basket | 3/3 |
+| pick up the butter and place it in the basket | 3/3 |
+| pick up the milk and place it in the basket | 3/3 |
+| pick up the chocolate pudding and place it in the basket | 3/3 |
+| pick up the orange juice and place it in the basket | 3/3 |
+
+**libero_goal** (96.7%)
+
+| Task | Rate |
+|------|------|
+| open the middle drawer of the cabinet | **2/3** |
+| put the bowl on the stove | 3/3 |
+| put the wine bottle on top of the cabinet | 3/3 |
+| open the top drawer and put the bowl inside | 3/3 |
+| put the bowl on top of the cabinet | 3/3 |
+| push the plate to the front of the stove | 3/3 |
+| put the cream cheese in the bowl | 3/3 |
+| turn on the stove | 3/3 |
+| put the bowl on the plate | 3/3 |
+| put the wine bottle on the rack | 3/3 |
+
+**libero_10** (96.7%)
+
+| Task | Rate |
+|------|------|
+| put both the alphabet soup and the tomato sauce in the basket | 3/3 |
+| put both the cream cheese box and the butter in the basket | 3/3 |
+| turn on the stove and put the moka pot on it | 3/3 |
+| put the black bowl in the bottom drawer of the cabinet and close it | 3/3 |
+| put the white mug on the left plate and put the yellow and white mug on the right plate | 3/3 |
+| pick up the book and place it in the back compartment of the caddy | 3/3 |
+| put the white mug on the plate and put the chocolate pudding to the right of the plate | 3/3 |
+| put both the alphabet soup and the cream cheese box in the basket | 3/3 |
+| put both moka pots on the stove | **2/3** |
+| put the yellow and white mug in the microwave and close it | 3/3 |
+
+</details>
+
+### Reference results (pi0.5 official, from paper, 50 trials/task)
+
+| Suite | Success Rate |
+|-------|-------------|
+| libero_spatial | 98.8% |
+| libero_object | 98.2% |
+| libero_goal | 98.0% |
+| libero_10 | 92.4% |
+| **Average** | **96.85%** |
