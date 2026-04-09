@@ -161,7 +161,10 @@ def train_joint(cfg, device, use_ddp, is_main):
 
     # --- Load pretrained weights ---
     if cfg.get("pretrained_weight_path"):
-        weight_path = os.path.join(cfg["pretrained_weight_path"], "model.safetensors")
+        weight_dir = cfg["pretrained_weight_path"]
+        weight_path = os.path.join(weight_dir, "model.safetensors")
+        if not os.path.isfile(weight_path):
+            weight_path = os.path.join(weight_dir, "model_merged.safetensors")
         logging.info(f"Loading pretrained weights from {weight_path}")
         PI0WaypointJoint.load_pretrained_weights(model, weight_path, device)
         if is_main:
