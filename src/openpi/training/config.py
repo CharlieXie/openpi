@@ -789,7 +789,7 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=None,  # Disable EMA for LoRA training
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        pytorch_weight_path="/workspace/models/pi05_base_pytorch",
         num_train_steps=30_000,
         # PyTorch LoRA configuration
         lora_config=lora_pytorch.LoRATrainingConfig(
