@@ -805,6 +805,44 @@ _CONFIGS = [
             train_vision_encoder=True,   # Train vision encoder (JAX-consistent)
         ),
     ),
+    TrainConfig(
+        name="pi05_libero_lora_pytorch_15k",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-4,
+            decay_steps=15_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        pytorch_weight_path="/workspace/models/pi05_base_pytorch",
+        num_train_steps=15_000,
+        lora_config=lora_pytorch.LoRATrainingConfig(
+            enabled=True,
+            attn_rank=16,
+            ffn_rank=16,
+            attn_alpha=16.0,
+            ffn_alpha=16.0,
+            use_rslora=False,
+            dropout=0.0,
+            apply_to="all",
+            train_non_lora_layers=True,
+            train_vision_encoder=True,
+        ),
+    ),
     #
     # Fine-tuning Aloha configs.
     #
