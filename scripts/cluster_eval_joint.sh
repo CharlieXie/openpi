@@ -35,25 +35,34 @@ export TORCHINDUCTOR_CACHE_DIR="$PIDIR/.torch_cache"
 export PYTHONPATH="$PIDIR/src:$PIDIR/third_party/libero:${PYTHONPATH:-}"
 export PYTHONFAULTHANDLER=1
 
-# Derive a short run name from the config's video_out_path for readable log filenames
-RUN_NAME=$(${PYTHON} -c "import yaml; c=yaml.safe_load(open('$CONFIG')); v=c.get('video_out_path','eval'); print(v.replace('data/libero/','').replace('videos_',''))" 2>/dev/null || echo "eval")
+CKPT_PATH=$(${PYTHON} -c "import yaml; c=yaml.safe_load(open('$CONFIG')); print(c['joint_checkpoint'])" 2>/dev/null)
+if [ -z "$CKPT_PATH" ]; then
+    echo "ERROR: Cannot read joint_checkpoint from config"
+    exit 1
+fi
 
-RESULTS_GPU0="logs/${RUN_NAME}_results_gpu0_${SLURM_JOB_ID}.json"
-RESULTS_GPU1="logs/${RUN_NAME}_results_gpu1_${SLURM_JOB_ID}.json"
+EVAL_DIR="${CKPT_PATH}/eval_libero"
+mkdir -p "${EVAL_DIR}/videos"
+
+cp "$CONFIG" "${EVAL_DIR}/eval_config_${SLURM_JOB_ID}.yaml"
+
+RESULTS_GPU0="${EVAL_DIR}/results_gpu0_${SLURM_JOB_ID}.json"
+RESULTS_GPU1="${EVAL_DIR}/results_gpu1_${SLURM_JOB_ID}.json"
 
 echo "=== Launching 2 GPU processes: tasks 0-4 on GPU 0, tasks 5-9 on GPU 1 ==="
-echo "Run name: $RUN_NAME"
+echo "Checkpoint: $CKPT_PATH"
+echo "Eval dir: $EVAL_DIR"
 
 CUDA_VISIBLE_DEVICES=0 $PYTHON -u -m openpi.waypoint.eval_libero \
     --config "$CONFIG" --task-start 0 --task-end 5 \
     --results-file "$RESULTS_GPU0" \
-    > logs/${RUN_NAME}_gpu0_${SLURM_JOB_ID}.log 2>&1 &
+    > "${EVAL_DIR}/eval_gpu0_${SLURM_JOB_ID}.log" 2>&1 &
 PID0=$!
 
 CUDA_VISIBLE_DEVICES=1 $PYTHON -u -m openpi.waypoint.eval_libero \
     --config "$CONFIG" --task-start 5 --task-end 10 \
     --results-file "$RESULTS_GPU1" \
-    > logs/${RUN_NAME}_gpu1_${SLURM_JOB_ID}.log 2>&1 &
+    > "${EVAL_DIR}/eval_gpu1_${SLURM_JOB_ID}.log" 2>&1 &
 PID1=$!
 
 echo "GPU 0 PID: $PID0 (tasks 0-4)"
@@ -96,7 +105,7 @@ for name, r in merged.items():
     print(f\"  {name}: {r['success_rate']:.2%} ({r['successes']}/{r['trials']})\")
 print('=' * 60)
 
-out = 'logs/${RUN_NAME}_merged_${SLURM_JOB_ID}.json'
+out = '${EVAL_DIR}/results_merged_${SLURM_JOB_ID}.json'
 with open(out, 'w') as fh:
     json.dump({'overall': {'success_rate': overall_rate, 'successes': total_success, 'trials': total_trials}, 'tasks': merged}, fh, indent=2)
 print(f'Merged results saved to {out}')
