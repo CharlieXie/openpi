@@ -191,10 +191,10 @@ def _action_stats(chunk: np.ndarray) -> str:
 
 
 def main(args: Args) -> None:
+    eval_start_time = time.time()
     _seed_everything(args.seed)
 
     # ── Load model ──────────────────────────────────────────────────────
-    log.info("Config name : %s", args.config_name)
     config = _config.get_config(args.config_name)
 
     ckpt_dir = args.checkpoint_dir
@@ -209,16 +209,25 @@ def main(args: Args) -> None:
     ckpt_local = _download.maybe_download(str(ckpt_dir))
     is_pytorch = os.path.exists(os.path.join(ckpt_local, "model.safetensors"))
     backend = "PyTorch" if is_pytorch else "JAX"
-    log.info("Checkpoint   : %s", ckpt_dir)
-    log.info("Local path   : %s", ckpt_local)
-    log.info("Backend      : %s (auto-detected)", backend)
 
+    print(flush=True)
+    print("╔" + "═" * 78 + "╗", flush=True)
+    print("║" + "LIBERO EVALUATION".center(78) + "║", flush=True)
+    print("╠" + "═" * 78 + "╣", flush=True)
+    print(f"║  Config      : {args.config_name:<60} ║", flush=True)
+    print(f"║  Checkpoint  : {str(ckpt_dir)[-60:]:<60} ║", flush=True)
+    print(f"║  Backend     : {backend:<60} ║", flush=True)
+    print(f"║  Task Suite  : {args.task_suite_name:<60} ║", flush=True)
+    print(f"║  Trials/Task : {args.num_trials_per_task:<60} ║", flush=True)
+    print(f"║  Seed        : {args.seed:<60} ║", flush=True)
+    print(f"║  Video Dir   : {args.video_out_path[-60:]:<60} ║", flush=True)
+    print("╚" + "═" * 78 + "╝", flush=True)
+    print(flush=True)
+
+    log.info("Loading model...")
     t0 = time.time()
     policy = _policy_config.create_trained_policy(config, ckpt_dir)
 
-    # Pin the Policy's JAX rng to a seed-derived key for reproducibility.
-    # (JAX path) Policy._rng defaults to key(0); override with our seed.
-    # (PyTorch path) noise comes from torch global RNG, already seeded above.
     if hasattr(policy, "_rng"):
         policy._rng = jax.random.key(args.seed)
     log.info("Model loaded in %.1fs  [%s]", time.time() - t0, backend)
@@ -230,17 +239,10 @@ def main(args: Args) -> None:
     if args.max_tasks > 0:
         num_tasks = min(num_tasks, args.max_tasks)
     max_steps = _get_max_steps(args.task_suite_name)
+    total_trials = num_tasks * args.num_trials_per_task
 
-    log.info("=" * 72)
-    log.info("Task suite     : %s", args.task_suite_name)
-    log.info("Num tasks      : %d", num_tasks)
-    log.info("Trials / task  : %d", args.num_trials_per_task)
-    log.info("Max steps      : %d  (+ %d wait steps)", max_steps, args.num_steps_wait)
-    log.info("Replan every   : %d steps", args.replan_steps)
-    log.info("Video output   : %s", args.video_out_path)
-    log.info("Seed           : %d", args.seed)
-    log.info("Dump actions   : %s", args.dump_actions or "(disabled)")
-    log.info("=" * 72)
+    log.info("Benchmark ready: %d tasks x %d trials = %d episodes, max_steps=%d",
+             num_tasks, args.num_trials_per_task, total_trials, max_steps)
 
     video_dir = pathlib.Path(args.video_out_path)
     video_dir.mkdir(parents=True, exist_ok=True)
@@ -249,27 +251,28 @@ def main(args: Args) -> None:
     total_episodes, total_successes = 0, 0
     per_task_results: dict[str, dict] = {}
     all_infer_times: list[float] = []
-    # For reproducibility verification: (task_id, episode_idx, infer_idx) -> action_chunk
     all_action_chunks: dict[str, np.ndarray] = {}
 
-    for task_id in tqdm.tqdm(range(num_tasks), desc="Tasks"):
+    # Track per-trial outcomes for the final table: list of (task_id, desc, trial_results[])
+    trial_log: list[tuple[int, str, list[bool]]] = []
+
+    for task_id in range(num_tasks):
         task = task_suite.get_task(task_id)
         initial_states = task_suite.get_task_init_states(task_id)
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
 
-        log.info("-" * 72)
-        log.info("TASK %d/%d: %s", task_id + 1, num_tasks, task_description)
-        log.info("-" * 72)
+        print(flush=True)
+        print("┌" + "─" * 78 + "┐", flush=True)
+        print(f"│  TASK {task_id + 1}/{num_tasks}: {task_description[:66]:<66} │", flush=True)
+        print("└" + "─" * 78 + "┘", flush=True)
 
         task_episodes, task_successes = 0, 0
+        task_trial_results: list[bool] = []
+        task_start = time.time()
 
-        for episode_idx in tqdm.tqdm(
-            range(args.num_trials_per_task), desc=f"  T{task_id}", leave=False
-        ):
-            log.info(
-                "  [Task %d  Episode %d/%d]  %s",
-                task_id, episode_idx + 1, args.num_trials_per_task, task_description,
-            )
+        for episode_idx in range(args.num_trials_per_task):
+            trial_label = f"[Task {task_id+1}/{num_tasks}  Trial {episode_idx+1}/{args.num_trials_per_task}]"
+            log.info("%s  Starting...", trial_label)
 
             env.reset()
             action_plan: collections.deque = collections.deque()
@@ -326,12 +329,6 @@ def main(args: Args) -> None:
                                 "    step=%d  infer #%d  (%.0fms)  chunk %s",
                                 t, ep_infer_count, infer_elapsed * 1000, _action_stats(chunk_arr),
                             )
-                            log.info(
-                                "    state: eef_pos=%s  eef_axangle=%s  gripper=%s",
-                                _fmt_array(eef_pos), _fmt_array(_quat2axisangle(eef_quat)),
-                                _fmt_array(gripper_qpos),
-                            )
-                            log.info("    first action: %s", _fmt_array(chunk_arr[0]))
 
                         assert len(action_chunk) >= args.replan_steps
                         action_plan.extend(action_chunk[: args.replan_steps])
@@ -352,17 +349,21 @@ def main(args: Args) -> None:
             task_episodes += 1
             total_episodes += 1
             elapsed = time.time() - ep_start
-            suffix = "success" if done else "failure"
+            success = bool(done)
+            task_trial_results.append(success)
+            marker = "PASS" if success else "FAIL"
 
             avg_infer_ms = (ep_infer_time_total / ep_infer_count * 1000) if ep_infer_count else 0
-            log.info(
-                "  => %s  steps=%d  time=%.1fs  infer_calls=%d  avg_infer=%.0fms  "
-                "episode %d/%d  running_sr=%.1f%% (%d/%d)",
-                suffix.upper(), t, elapsed, ep_infer_count, avg_infer_ms,
-                total_episodes, num_tasks * args.num_trials_per_task,
-                total_successes / total_episodes * 100, total_successes, total_episodes,
+            running_sr = total_successes / total_episodes * 100
+
+            print(
+                f"  {marker:4s} │ Trial {episode_idx+1}/{args.num_trials_per_task} │ "
+                f"steps={t:<4d} │ {elapsed:5.1f}s │ infer={ep_infer_count:3d}x {avg_infer_ms:4.0f}ms │ "
+                f"running: {total_successes}/{total_episodes} ({running_sr:.1f}%)",
+                flush=True,
             )
 
+            suffix = "success" if success else "failure"
             task_tag = task_description.replace(" ", "_")[:80]
             video_path = video_dir / f"task{task_id:02d}_ep{episode_idx:02d}_{suffix}_{task_tag}.mp4"
             if replay_images:
@@ -378,10 +379,14 @@ def main(args: Args) -> None:
             "total": task_episodes,
             "rate": task_sr,
         }
-        log.info(
-            "  Task %d done: %d/%d (%.1f%%)  |  overall so far: %d/%d (%.1f%%)",
-            task_id, task_successes, task_episodes, task_sr * 100,
-            total_successes, total_episodes, total_successes / total_episodes * 100,
+        trial_log.append((task_id, task_description, task_trial_results))
+
+        task_elapsed = time.time() - task_start
+        trials_str = " ".join("✓" if r else "✗" for r in task_trial_results)
+        print(
+            f"  ──── Task {task_id+1} result: {task_successes}/{task_episodes} "
+            f"({task_sr*100:.0f}%)  [{trials_str}]  ({task_elapsed:.0f}s)",
+            flush=True,
         )
 
     # ── Dump action chunks for reproducibility verification ─────────────
@@ -391,34 +396,30 @@ def main(args: Args) -> None:
         np.savez(dump_path, **all_action_chunks)
         log.info("Action chunks saved: %s  (%d chunks)", dump_path, len(all_action_chunks))
 
-    # ── Summary ─────────────────────────────────────────────────────────
+    # ── Final Summary ────────────────────────────────────────────────────
     overall_sr = total_successes / total_episodes * 100 if total_episodes > 0 else 0.0
     avg_infer_all = np.mean(all_infer_times) * 1000 if all_infer_times else 0
+    total_elapsed = time.time() - eval_start_time
 
-    log.info("")
-    log.info("=" * 80)
-    log.info(
-        "RESULTS  --  %s  |  %d trials/task  |  backend=%s  |  seed=%d",
-        args.task_suite_name, args.num_trials_per_task, backend, args.seed,
-    )
-    log.info("=" * 80)
-    log.info("%-4s  %-55s  %s  %s", "ID", "Task", "Result", "Rate")
-    log.info("-" * 80)
-    for desc, r in per_task_results.items():
-        log.info(
-            "T%-3d  %-55s  %d / %d   %5.1f%%",
-            r["task_id"], desc[:55], r["success"], r["total"], r["rate"] * 100,
+    print(flush=True)
+    print("╔" + "═" * 78 + "╗", flush=True)
+    print("║" + f"  RESULTS: {args.task_suite_name}  |  {args.num_trials_per_task} trials/task  |  {backend}  |  seed={args.seed}".ljust(78) + "║", flush=True)
+    print("╠" + "═" * 78 + "╣", flush=True)
+    print(f"║  {'ID':<4}  {'Task':<46}  {'Pass':>4}  {'Total':>5}  {'Rate':>6}  {'Trials':<6} ║", flush=True)
+    print("║" + "─" * 78 + "║", flush=True)
+    for tid, desc, trials in trial_log:
+        r = per_task_results[desc]
+        trials_str = " ".join("✓" if x else "✗" for x in trials)
+        print(
+            f"║  T{tid:<3d}  {desc[:46]:<46}  {r['success']:>4d}  {r['total']:>5d}  "
+            f"{r['rate']*100:5.1f}%  {trials_str:<6} ║",
+            flush=True,
         )
-    log.info("-" * 80)
-    log.info("OVERALL: %d / %d  (%.1f%%)", total_successes, total_episodes, overall_sr)
-    log.info(
-        "Inference: %d calls  avg=%.0fms  min=%.0fms  max=%.0fms",
-        len(all_infer_times),
-        avg_infer_all,
-        np.min(all_infer_times) * 1000 if all_infer_times else 0,
-        np.max(all_infer_times) * 1000 if all_infer_times else 0,
-    )
-    log.info("=" * 80)
+    print("╠" + "═" * 78 + "╣", flush=True)
+    print(f"║  OVERALL: {total_successes} / {total_episodes}  ({overall_sr:.1f}%)".ljust(79) + "║", flush=True)
+    print(f"║  Inference: {len(all_infer_times)} calls  avg={avg_infer_all:.0f}ms  min={np.min(all_infer_times)*1000:.0f}ms  max={np.max(all_infer_times)*1000:.0f}ms".ljust(79) + "║" if all_infer_times else "", flush=True)
+    print(f"║  Total time: {total_elapsed/60:.1f} min".ljust(79) + "║", flush=True)
+    print("╚" + "═" * 78 + "╝", flush=True)
 
     summary = {
         "config": args.config_name,
@@ -431,15 +432,22 @@ def main(args: Args) -> None:
         "total_successes": total_successes,
         "total_episodes": total_episodes,
         "avg_infer_ms": round(avg_infer_all, 1),
+        "total_time_sec": round(total_elapsed, 1),
         "per_task": {
-            desc: {"success": r["success"], "total": r["total"], "rate": round(r["rate"] * 100, 1)}
-            for desc, r in per_task_results.items()
+            desc: {
+                "task_id": r["task_id"],
+                "success": r["success"],
+                "total": r["total"],
+                "rate": round(r["rate"] * 100, 1),
+                "trials": [x for x in trials],
+            }
+            for (_, desc, trials), r in zip(trial_log, per_task_results.values())
         },
     }
     summary_path = video_dir / "eval_summary.json"
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
-    log.info("Summary written to %s", summary_path)
+    log.info("Summary JSON: %s", summary_path)
 
 
 if __name__ == "__main__":

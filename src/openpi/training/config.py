@@ -789,7 +789,7 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=None,  # Disable EMA for LoRA training
-        pytorch_weight_path="/workspace/models/pi05_base_pytorch",
+        pytorch_weight_path="/workspace/model/pi05_base_pytorch",
         num_train_steps=30_000,
         # PyTorch LoRA configuration
         lora_config=lora_pytorch.LoRATrainingConfig(
@@ -841,6 +841,46 @@ _CONFIGS = [
             apply_to="all",
             train_non_lora_layers=True,
             train_vision_encoder=True,
+        ),
+    ),
+    TrainConfig(
+        name="pi05_libero_lora_pytorch_4_gpu",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            # Use standard variants - LoRA will be applied dynamically
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=80,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=800,
+            peak_lr=9e-5,  # Higher LR for LoRA
+            decay_steps=8_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,  # Disable EMA for LoRA training
+        pytorch_weight_path="/workspace/model/pi05_base_pytorch",
+        num_train_steps=8_000,
+        # PyTorch LoRA configuration
+        lora_config=lora_pytorch.LoRATrainingConfig(
+            enabled=True,
+            attn_rank=16,        # LoRA rank for attention layers
+            ffn_rank=16,         # LoRA rank for FFN layers
+            attn_alpha=16.0,     # LoRA alpha for attention
+            ffn_alpha=16.0,      # LoRA alpha for FFN
+            use_rslora=False,    # Use rank-stabilized LoRA
+            dropout=0.0,
+            apply_to="all",      # Apply to both PaliGemma and Expert
+            train_non_lora_layers=True,  # Also train action projections
+            train_vision_encoder=True,   # Train vision encoder (JAX-consistent)
         ),
     ),
     #
