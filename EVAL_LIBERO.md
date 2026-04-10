@@ -227,6 +227,86 @@ print(f'{sum(d==0 for d in diffs)}/{len(diffs)} exact, max_diff={max(diffs)}')
 
 </details>
 
+### Our eval — pi0.5 LoRA fine-tune (PyTorch, 4x RTX 4090, 8000 steps, 5 trials/task, seed=7, 2026-04-10)
+
+**Training config:** `pi05_libero_lora_pytorch_4_gpu` · LoRA rank=16 · batch=80 · peak_lr=9e-5 · 8000 steps  
+**Checkpoint:** `checkpoints/pi05_libero_lora_pytorch_4_gpu/pi05_libero_lora_pytorch_4_gpu/8000`
+
+| Suite | Success | Rate | Avg Infer | Failed Tasks |
+|-------|---------|------|-----------|--------------|
+| libero_spatial | 50/50 | **100.0%** | 391 ms | — |
+| libero_object | 48/50 | **96.0%** | 400 ms | bbq sauce (4/5), tomato sauce (4/5) |
+| libero_goal | 46/50 | **92.0%** | 392 ms | open top drawer+bowl (3/5), bowl on cabinet (4/5), cream cheese in bowl (4/5) |
+| libero_10 | 47/50 | **94.0%** | 371 ms | white+yellow mugs (4/5), moka pots (4/5), mug in microwave (4/5) |
+| **Average** | **191/200** | **95.5%** | | |
+
+<details>
+<summary>Per-task breakdown (click to expand)</summary>
+
+**libero_spatial** (50/50 · 100.0%)
+
+| Task | Result | Trials |
+|------|--------|--------|
+| pick up the black bowl between the plate and the ramekin and place it on the plate | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| pick up the black bowl next to the ramekin and place it on the plate | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| pick up the black bowl from table center and place it on the plate | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| pick up the black bowl on the cookie box and place it on the plate | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| pick up the black bowl on the ramekin and place it on the plate | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| pick up the black bowl next to the cookie box and place it on the plate | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| pick up the black bowl on the stove and place it on the plate | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| pick up the black bowl next to the plate and place it on the plate | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| pick up the black bowl on the wooden cabinet and place it on the plate | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+
+**libero_object** (48/50 · 96.0%)
+
+| Task | Result | Trials |
+|------|--------|--------|
+| pick up the alphabet soup and place it in the basket | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| pick up the cream cheese and place it in the basket | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| pick up the salad dressing and place it in the basket | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| pick up the bbq sauce and place it in the basket | **4/5** | ✓ ✗ ✓ ✓ ✓ |
+| pick up the ketchup and place it in the basket | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| pick up the tomato sauce and place it in the basket | **4/5** | ✗ ✓ ✓ ✓ ✓ |
+| pick up the butter and place it in the basket | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| pick up the milk and place it in the basket | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| pick up the chocolate pudding and place it in the basket | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| pick up the orange juice and place it in the basket | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+
+**libero_goal** (46/50 · 92.0%)
+
+| Task | Result | Trials |
+|------|--------|--------|
+| open the middle drawer of the cabinet | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| put the bowl on the stove | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| put the wine bottle on top of the cabinet | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| open the top drawer and put the bowl inside | **3/5** | ✓ ✗ ✗ ✓ ✓ |
+| put the bowl on top of the cabinet | **4/5** | ✓ ✓ ✓ ✗ ✓ |
+| push the plate to the front of the stove | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| put the cream cheese in the bowl | **4/5** | ✓ ✓ ✓ ✓ ✗ |
+| turn on the stove | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| put the bowl on the plate | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| put the wine bottle on the rack | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+
+**libero_10** (47/50 · 94.0%)
+
+| Task | Result | Trials |
+|------|--------|--------|
+| put both the alphabet soup and the tomato sauce in the basket | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| put both the cream cheese box and the butter in the basket | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| turn on the stove and put the moka pot on it | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| put the black bowl in the bottom drawer of the cabinet and close it | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| put the white mug on the left plate and put the yellow and white mug on the right plate | **4/5** | ✗ ✓ ✓ ✓ ✓ |
+| pick up the book and place it in the back compartment of the caddy | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| put the white mug on the plate and put the chocolate pudding to the right of the plate | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| put both the alphabet soup and the cream cheese box in the basket | 5/5 | ✓ ✓ ✓ ✓ ✓ |
+| put both moka pots on the stove | **4/5** | ✓ ✗ ✓ ✓ ✓ |
+| put the yellow and white mug in the microwave and close it | **4/5** | ✓ ✓ ✓ ✓ ✗ |
+
+</details>
+
+---
+
 ### Reference results (pi0.5 official, from paper, 50 trials/task)
 
 | Suite | Success Rate |
