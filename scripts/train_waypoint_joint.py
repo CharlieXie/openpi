@@ -131,6 +131,11 @@ def train_joint(cfg, device, use_ddp, is_main):
         episode_shuffle_buffer=cfg.get("episode_shuffle_buffer_size", 0),
         image_aug=cfg.get("image_aug", False),
         image_aug_cfg=cfg.get("image_aug_cfg", None),
+        aug_sub_chunk=cfg.get("aug_sub_chunk", False),
+        aug_concat=cfg.get("aug_concat", False),
+        min_sub_duration=cfg.get("min_sub_duration", 7),
+        num_sub_chunks=cfg.get("num_sub_chunks", 2),
+        max_concat_n=cfg.get("max_concat_n", 2),
     )
     ae_collator = WaypointAECollator()
     ae_loader = torch.utils.data.DataLoader(

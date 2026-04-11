@@ -61,12 +61,19 @@ image_aug_cfg:
   saturation: [0.8, 1.2]
   hue: 0.05
 
+# AE data augmentation — Boundary Shifting
+aug_sub_chunk: true
+aug_concat: true
+min_sub_duration: 7
+num_sub_chunks: 2
+max_concat_n: 2
+
 # Shuffle buffers
 vlm_shuffle_buffer_size: 5000
-ae_shuffle_buffer_size: 1000
+ae_shuffle_buffer_size: 5000
 
 # Logging and checkpointing
-exp_name: waypoint_joint_libero_10_lora_sg_0.3_4090_4gpu
+exp_name: waypoint_joint_libero_10_lora_sg_0.3_5090_4gpu
 checkpoint_dir: /workspace/openpi/checkpoints/{exp_name}
 save_interval: 1000
 log_interval: 100

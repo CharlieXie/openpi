@@ -56,6 +56,11 @@ class WaypointAEDataset(IterableDataset):
         episode_shuffle_buffer: int = 0,
         image_aug: bool = False,
         image_aug_cfg: dict | None = None,
+        aug_sub_chunk: bool = False,
+        aug_concat: bool = False,
+        min_sub_duration: int = 7,
+        num_sub_chunks: int = 2,
+        max_concat_n: int = 2,
     ):
         super().__init__()
         self.original_rlds_dir = original_rlds_dir
@@ -68,6 +73,11 @@ class WaypointAEDataset(IterableDataset):
         self.shuffle_buffer_size = shuffle_buffer_size
         self.image_size = image_size
         self.episode_shuffle_buffer = episode_shuffle_buffer
+        self.aug_sub_chunk = aug_sub_chunk
+        self.aug_concat = aug_concat
+        self.min_sub_duration = min_sub_duration
+        self.num_sub_chunks = num_sub_chunks
+        self.max_concat_n = max_concat_n
 
         self.norm_helper = NormalizationHelper(dataset_statistics, norm_type)
 
@@ -105,17 +115,126 @@ class WaypointAEDataset(IterableDataset):
                 self.episode_wp_map[ep["src_ep_idx"]] = valid_pairs
                 total_pairs += len(valid_pairs)
 
-        self.total_pairs = total_pairs
+        # Pre-compute concatenated pairs (boundary shifting augmentation).
+        # Uses a sliding window over consecutive pairs: for each starting pair j,
+        # extend by up to max_concat_n-1 successive pairs as long as they are
+        # temporally adjacent and the combined duration fits within max_duration.
+        total_concat = 0
+        if self.aug_concat:
+            for ep_idx in list(self.episode_wp_map.keys()):
+                pairs = self.episode_wp_map[ep_idx]
+                orig_len = len(pairs)
+                concat_pairs = []
+                for j in range(orig_len):
+                    combined_start = pairs[j][0]
+                    combined_dur = pairs[j][2]
+                    for k in range(j + 1, min(j + self.max_concat_n, orig_len)):
+                        if pairs[k][0] != pairs[k - 1][1]:
+                            break
+                        combined_dur += pairs[k][2]
+                        if combined_dur > self.max_duration:
+                            break
+                        concat_pairs.append((combined_start, pairs[k][1], combined_dur))
+                pairs.extend(concat_pairs)
+                total_concat += len(concat_pairs)
+            total_pairs += total_concat
+
+        # Estimate sub-chunk yield count (random, so approximate).
+        total_sub_est = 0
+        if self.aug_sub_chunk:
+            for pairs in self.episode_wp_map.values():
+                for _, _, dur in pairs:
+                    if dur > self.min_sub_duration:
+                        total_sub_est += self.num_sub_chunks
+            total_sub_est = int(total_sub_est * 0.9)
+
+        self.total_pairs = total_pairs + total_sub_est
         logger.info(
             f"WaypointAEDataset: {len(self.episode_wp_map)} episodes, "
-            f"{total_pairs} valid pairs, {skipped} skipped (dur>{max_duration}), "
-            f"actual_action={robot_config.actual_action_dim}→{model_action_dim}, "
-            f"proprio={robot_config.continuous_proprio_dim}+1grip={ae_proprio_dim}→{model_proprio_dim}, "
-            f"episode_shuffle_buffer={episode_shuffle_buffer}"
+            f"{total_pairs - total_concat} original pairs, {skipped} skipped (dur>{max_duration}), "
+            f"{total_concat} concat pairs, ~{total_sub_est} sub-chunks, "
+            f"~{self.total_pairs} total est. samples, "
+            f"actual_action={robot_config.actual_action_dim}->{model_action_dim}, "
+            f"proprio={robot_config.continuous_proprio_dim}+1grip={ae_proprio_dim}->{model_proprio_dim}"
         )
 
     def __len__(self) -> int:
         return self.total_pairs
+
+    def _make_sample(self, steps, all_actions, instruction, w_start, w_end, duration, rc):
+        """Build one AE training sample from a (w_start, w_end, duration) tuple."""
+        images = {}
+        for view, rlds_key in rc.camera_rlds_keys.items():
+            model_key = rc.camera_model_keys[view]
+            img_data = steps[w_start]["observation"][rlds_key].numpy()
+            img = Image.fromarray(img_data)
+            if img.size != self.image_size:
+                img = img.resize(self.image_size, Image.BILINEAR)
+            if self.image_aug_transform is not None:
+                img = self.image_aug_transform(img)
+            images[model_key] = np.array(img, dtype=np.uint8)
+
+        start_proprio_raw = extract_proprio_from_obs(
+            {k: steps[w_start]["observation"][k] for k in steps[w_start]["observation"]},
+            rc.state_obs_keys,
+        )
+        end_proprio_raw = extract_proprio_from_obs(
+            {k: steps[w_end]["observation"][k] for k in steps[w_end]["observation"]},
+            rc.state_obs_keys,
+        )
+
+        start_cont, start_grip = rc.split_proprio(start_proprio_raw)
+        end_cont, end_grip = rc.split_proprio(end_proprio_raw)
+        start_cont_norm = self.norm_helper.normalize_proprio(start_cont)
+        end_cont_norm = self.norm_helper.normalize_proprio(end_cont)
+        start_7d = np.concatenate([start_cont_norm, [float(start_grip)]])
+        end_7d = np.concatenate([end_cont_norm, [float(end_grip)]])
+
+        start_proprio = pad_to_dim(start_7d, self.model_proprio_dim)
+        end_proprio = pad_to_dim(end_7d, self.model_proprio_dim)
+
+        seg_actions = all_actions[w_start:w_end]
+        actual_len = len(seg_actions)
+        padded_actions = np.zeros(
+            (self.horizon_steps, self.model_action_dim), dtype=np.float32
+        )
+        padded_actions[:actual_len, : rc.actual_action_dim] = seg_actions[:actual_len]
+
+        action_pad_mask = np.zeros(self.horizon_steps, dtype=bool)
+        action_pad_mask[actual_len:] = True
+
+        return {
+            "images": images,
+            "instruction": instruction,
+            "start_proprio": start_proprio.astype(np.float32),
+            "end_proprio": end_proprio.astype(np.float32),
+            "duration": float(duration),
+            "actions": padded_actions.astype(np.float32),
+            "action_pad_mask": action_pad_mask,
+            "action_dim_mask": self.action_dim_mask.copy(),
+            "proprio_dim_mask": self.proprio_dim_mask.copy(),
+        }
+
+    def _generate_sub_chunks(self, steps, all_actions, instruction, w_start, duration, rc):
+        """Generate random sub-chunk samples from a waypoint-pair segment.
+
+        Samples random sub-intervals [i, j) within [0, duration) such that
+        j - i >= min_sub_duration, skipping any that duplicate the original pair.
+        """
+        n_steps = len(steps)
+        for _ in range(self.num_sub_chunks):
+            max_start_offset = duration - self.min_sub_duration
+            i = np.random.randint(0, max_start_offset + 1)
+            j = np.random.randint(i + self.min_sub_duration, duration + 1)
+            if i == 0 and j == duration:
+                continue
+            sub_start = w_start + i
+            sub_end = w_start + j
+            if sub_end >= n_steps:
+                continue
+            yield self._make_sample(
+                steps, all_actions, instruction, sub_start, sub_end, j - i, rc
+            )
 
     def _process_episode(self, steps, wp_pairs, rc):
         """Extract waypoint-pair samples from a single episode's steps."""
@@ -131,60 +250,13 @@ class WaypointAEDataset(IterableDataset):
         for w_start, w_end, duration in wp_pairs:
             if w_end >= len(steps):
                 continue
-
-            images = {}
-            for view, rlds_key in rc.camera_rlds_keys.items():
-                model_key = rc.camera_model_keys[view]
-                img_data = steps[w_start]["observation"][rlds_key].numpy()
-                img = Image.fromarray(img_data)
-                if img.size != self.image_size:
-                    img = img.resize(self.image_size, Image.BILINEAR)
-                if self.image_aug_transform is not None:
-                    img = self.image_aug_transform(img)
-                images[model_key] = np.array(img, dtype=np.uint8)
-
-            start_proprio_raw = extract_proprio_from_obs(
-                {k: steps[w_start]["observation"][k] for k in steps[w_start]["observation"]},
-                rc.state_obs_keys,
+            yield self._make_sample(
+                steps, all_actions, instruction, w_start, w_end, duration, rc
             )
-            end_proprio_raw = extract_proprio_from_obs(
-                {k: steps[w_end]["observation"][k] for k in steps[w_end]["observation"]},
-                rc.state_obs_keys,
-            )
-
-            # Split into continuous dims + binary gripper, normalize
-            # continuous, then reassemble as 7D: [continuous_norm, grip_binary]
-            start_cont, start_grip = rc.split_proprio(start_proprio_raw)
-            end_cont, end_grip = rc.split_proprio(end_proprio_raw)
-            start_cont_norm = self.norm_helper.normalize_proprio(start_cont)
-            end_cont_norm = self.norm_helper.normalize_proprio(end_cont)
-            start_7d = np.concatenate([start_cont_norm, [float(start_grip)]])
-            end_7d = np.concatenate([end_cont_norm, [float(end_grip)]])
-
-            start_proprio = pad_to_dim(start_7d, self.model_proprio_dim)
-            end_proprio = pad_to_dim(end_7d, self.model_proprio_dim)
-
-            seg_actions = all_actions[w_start:w_end]
-            actual_len = len(seg_actions)
-            padded_actions = np.zeros(
-                (self.horizon_steps, self.model_action_dim), dtype=np.float32
-            )
-            padded_actions[:actual_len, : rc.actual_action_dim] = seg_actions[:actual_len]
-
-            action_pad_mask = np.zeros(self.horizon_steps, dtype=bool)
-            action_pad_mask[actual_len:] = True
-
-            yield {
-                "images": images,
-                "instruction": instruction,
-                "start_proprio": start_proprio.astype(np.float32),
-                "end_proprio": end_proprio.astype(np.float32),
-                "duration": float(duration),
-                "actions": padded_actions.astype(np.float32),
-                "action_pad_mask": action_pad_mask,
-                "action_dim_mask": self.action_dim_mask.copy(),
-                "proprio_dim_mask": self.proprio_dim_mask.copy(),
-            }
+            if self.aug_sub_chunk and duration > self.min_sub_duration:
+                yield from self._generate_sub_chunks(
+                    steps, all_actions, instruction, w_start, duration, rc
+                )
 
     def _raw_sample_iter(self):
         """Yield raw samples from RLDS. DDP-aware, repeats indefinitely.
