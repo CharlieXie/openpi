@@ -791,21 +791,18 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=None,  # Disable EMA for LoRA training
-        pytorch_weight_path="/workspace/models/pi05_base_pytorch",
+        pytorch_weight_path="/workspace/model/pi05_base_pytorch",
         num_train_steps=1250,
         log_interval=10,
         # PyTorch LoRA configuration
         lora_config=lora_pytorch.LoRATrainingConfig(
             enabled=True,
-            attn_rank=16,        # LoRA rank for attention layers
-            ffn_rank=16,         # LoRA rank for FFN layers
-            attn_alpha=16.0,     # LoRA alpha for attention
-            ffn_alpha=16.0,      # LoRA alpha for FFN
-            use_rslora=False,    # Use rank-stabilized LoRA
+            rank=16,
+            alpha=16.0,
+            use_rslora=False,
             dropout=0.0,
-            apply_to="all",      # Apply to both PaliGemma and Expert
-            train_non_lora_layers=True,  # Also train action projections
-            train_vision_encoder=True,   # Train vision encoder (JAX-consistent)
+            apply_to="all",
+            vision_encoder_mode="freeze",
         ),
     ),
     #

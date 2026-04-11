@@ -5,12 +5,12 @@ robot_type: libero
 
 # --- Data paths ---
 # AE data
-original_rlds_dir: /projects/chuanlia001ssd/data/libero/10/libero_10_no_noops/1.0.0
-wp_indices_path: /projects/chuanlia001ssd/data/libero/10/libero_10_wp_0006/waypoint_indices.json
+original_rlds_dir: /workspace/data/libero_10_no_noops/1.0.0
+wp_indices_path: /workspace/data/libero_10_wp_0006/waypoint_indices.json
 # VLM data
-wp_rlds_dir: /projects/chuanlia001ssd/data/libero/10/libero_10_wp_0006/waypoint_filtered_rlds__libero/1.0.0
+wp_rlds_dir: /workspace/data/libero_10_wp_0006/waypoint_filtered_rlds__libero/1.0.0
 # Shared
-dataset_statistics_path: /projects/chuanlia001ssd/data/libero/10/dataset_statistics.json
+dataset_statistics_path: /workspace/data/dataset_statistics.json
 
 # --- Model architecture ---
 paligemma_variant: gemma_2b
@@ -30,7 +30,7 @@ vlm_max_token_len: 256
 stride: 1
 
 # Pretrained weights — LoRA-merged checkpoint (base + step-800 LoRA)
-pretrained_weight_path: /projects/chuanlia001ssd/models/900
+pretrained_weight_path: /workspace/model/pi05_base_pytorch
 
 # --- Joint training ---
 gradient_strategy: scale_gradient       # "none" | "stop_gradient" | "scale_gradient" | "freeze_backbone"
@@ -38,13 +38,13 @@ gradient_scale: 0.3                     # only used when gradient_strategy=scale
 ae_loss_weight: 1.0
 
 # Batch sizes (per GPU)
-vlm_batch_size: 280
-ae_batch_size: 280
+vlm_batch_size: 20
+ae_batch_size: 20
 
 # Training hyperparameters
-num_train_steps: 1600
-warmup_steps: 100
-peak_lr: 1.5e-4
+num_train_steps: 10000
+warmup_steps: 1000
+peak_lr: 2.0e-4
 end_lr: 1.0e-5
 
 # Normalization
@@ -66,10 +66,10 @@ vlm_shuffle_buffer_size: 5000
 ae_shuffle_buffer_size: 1000
 
 # Logging and checkpointing
-exp_name: waypoint_joint_libero_10_lora_sg_0.3_reproduce_continue1
-checkpoint_dir: /projects/chuanlia001/checkpoints/{exp_name}
-save_interval: 100
-log_interval: 4
+exp_name: waypoint_joint_libero_10_lora_sg_0.3_4090_4gpu
+checkpoint_dir: /workspace/openpi/checkpoints/{exp_name}
+save_interval: 1000
+log_interval: 100
 wandb_enabled: true
 wandb_project: waypoint_e2e
 
