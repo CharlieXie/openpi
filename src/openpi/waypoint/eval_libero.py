@@ -422,7 +422,8 @@ def load_pg_tokenizer():
 
 
 @torch.no_grad()
-def predict_actions(ae_model, images, instruction, start_wp, end_wp, duration, device, pg_tok):
+def predict_actions(ae_model, images, instruction, start_wp, end_wp, duration, device, pg_tok,
+                    noise_generator=None):
     """Action Expert flow matching inference."""
     img_tensors = {}
     img_masks = {}
@@ -466,7 +467,14 @@ def predict_actions(ae_model, images, instruction, start_wp, end_wp, duration, d
     end_t = torch.from_numpy(end_wp).float().unsqueeze(0).to(device)
     dur_t = torch.tensor([float(duration)], dtype=torch.float32, device=device)
 
-    actions = ae_model.sample_actions(obs, start_t, end_t, dur_t)
+    noise = None
+    if noise_generator is not None:
+        noise = torch.randn(
+            1, ae_model.action_horizon, ae_model.action_dim,
+            generator=noise_generator, device="cpu",
+        ).to(device)
+
+    actions = ae_model.sample_actions(obs, start_t, end_t, dur_t, noise=noise)
     return actions.squeeze(0).cpu().numpy()
 
 
@@ -486,6 +494,7 @@ def _fmt_array(a, n=4):
 def run_episode(
     vlm, ae_model, wp_tokenizer, norm_helper,
     env, initial_state, task_desc, cfg, device, pg_tok,
+    noise_generator=None,
 ):
     """Run one LIBERO episode with the two-stage waypoint pipeline.
 
@@ -586,6 +595,7 @@ def run_episode(
             t_ae = time.time()
             actions_norm = predict_actions(
                 ae_model, fresh_images, task_desc, start_wp, end_wp, duration, device, pg_tok,
+                noise_generator=noise_generator,
             )
             ae_ms = (time.time() - t_ae) * 1000
 
@@ -643,9 +653,36 @@ def run_episode(
 # Main evaluation
 # ---------------------------------------------------------------------------
 
+def _setup_seed(seed, deterministic_sdpa=False):
+    """Set global RNG seeds for reproducible evaluation."""
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    if deterministic_sdpa:
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        logger.info(f"Eval seed set: {seed} (all RNGs seeded, CUDA deterministic, math SDPA only)")
+    else:
+        logger.info(f"Eval seed set: {seed} (all RNGs seeded, CUDA deterministic)")
+
+
 def evaluate(cfg):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
+
+    eval_seed = cfg.get("eval_seed", None)
+    noise_generator = None
+    if eval_seed is not None:
+        _setup_seed(eval_seed, deterministic_sdpa=cfg.get("deterministic_sdpa", False))
+        noise_generator = torch.Generator(device="cpu")
+        noise_generator.manual_seed(eval_seed)
 
     t_total = time.time()
     use_joint = "joint_checkpoint" in cfg
@@ -729,9 +766,12 @@ def evaluate(cfg):
         for trial in range(min(num_trials, len(initial_states))):
             t_ep = time.time()
             logger.info(f"Task {task_idx}/{num_tasks}: {task_name} trial {trial}")
+            if noise_generator is not None:
+                noise_generator.manual_seed(eval_seed + task_idx * 1000 + trial)
             success, replay_images = run_episode(
                 vlm, ae_model, wp_tokenizer, norm_helper,
                 env, initial_states[trial], task_desc, cfg, device, pg_tok,
+                noise_generator=noise_generator,
             )
             ep_secs = time.time() - t_ep
             if success:
