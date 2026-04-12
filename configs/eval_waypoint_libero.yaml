@@ -1,8 +1,10 @@
-# Waypoint VLA evaluation config — LIBERO Object
+# Waypoint VLA evaluation config — LIBERO (separate VLM + AE checkpoints)
 # Usage: python -m openpi.waypoint.eval_libero --config configs/eval_waypoint_libero.yaml
+#
+# Uses separate VLM + AE checkpoints. For joint model eval, use eval_waypoint_joint_libero.yaml.
 
 robot_type: libero
-task_suite: libero_spatial
+task_suite: libero_10
 
 # Model checkpoints (set these to your trained checkpoint directories)
 vlm_checkpoint: /workspace/models/vlm
@@ -16,7 +18,8 @@ model_action_dim: 32
 model_proprio_dim: 32
 horizon_steps: 32
 num_waypoints: 7
-max_token_len: 256
+vlm_max_token_len: 256
+ae_max_token_len: 64
 
 # Model architecture
 paligemma_variant: gemma_2b
@@ -27,12 +30,25 @@ precision: bfloat16
 norm_type: q99
 
 # Inference optimization
-vlm_precision: bfloat16
 torch_compile: true
 
+# Center crop — inference equivalent of training's RandomResizedCrop.
+# Enable when the model was trained with image_aug: true + RandomResizedCrop.
+# center_crop_scale should match training's fixed area ratio (0.9),
+# aligned with VLA-Adapter's random_resized_crop scale=[0.9, 0.9].
+center_crop: true
+center_crop_scale: 0.9
+
 # Evaluation
-num_trials_per_task: 10
+num_trials_per_task: 5
 num_steps_wait: 10
 
+# Reproducibility: set eval_seed to fix flow matching noise for deterministic actions.
+# Remove or comment out to disable (non-deterministic, default behavior).
+eval_seed: 7
+# Bit-exact reproducibility: disable Flash/MemEfficient SDPA (~70% slower AE inference).
+# Only needed if you require bit-identical outputs across runs.
+# deterministic_sdpa: true
+
 # Video output
-video_out_path: data/libero/videos_wp_spatial
+video_out_path: data/libero/videos_wp

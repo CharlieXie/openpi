@@ -208,7 +208,7 @@ def load_vlm(cfg, device):
     vlm_precision = cfg.get("vlm_precision", "bfloat16")
     model_cfg = pi0_config.Pi0Config(
         pi05=False,
-        max_token_len=cfg.get("max_token_len", 256),
+        max_token_len=cfg.get("vlm_max_token_len", cfg.get("max_token_len", 256)),
         paligemma_variant=cfg.get("paligemma_variant", "gemma_2b"),
         dtype=vlm_precision,
     )
@@ -278,7 +278,7 @@ def load_ae(cfg, device):
         pi05=True,
         action_dim=cfg.get("model_action_dim", 32),
         action_horizon=cfg.get("horizon_steps", 32),
-        max_token_len=cfg.get("max_token_len", 64),
+        max_token_len=cfg.get("ae_max_token_len", cfg.get("max_token_len", 64)),
         paligemma_variant=cfg.get("paligemma_variant", "gemma_2b"),
         action_expert_variant=cfg.get("action_expert_variant", "gemma_300m"),
         dtype=cfg.get("precision", "bfloat16"),
@@ -709,7 +709,7 @@ def evaluate(cfg):
     wp_tokenizer = WaypointTokenizer(
         proprio_dim=rc.continuous_proprio_dim,
         num_waypoints=cfg.get("num_waypoints", 7),
-        max_token_len=cfg.get("max_token_len", 256),
+        max_token_len=cfg.get("vlm_max_token_len", cfg.get("max_token_len", 256)),
         use_gripper_token=True,
     )
 

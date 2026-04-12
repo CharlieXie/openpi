@@ -131,6 +131,7 @@ def train_joint(cfg, device, use_ddp, is_main):
         episode_shuffle_buffer=cfg.get("episode_shuffle_buffer_size", 0),
         image_aug=cfg.get("image_aug", False),
         image_aug_cfg=cfg.get("image_aug_cfg", None),
+        ae_max_shift=cfg.get("ae_max_shift", 0),
     )
     ae_collator = WaypointAECollator()
     ae_loader = torch.utils.data.DataLoader(
@@ -379,17 +380,19 @@ def train_joint(cfg, device, use_ddp, is_main):
             start_time = time.time()
 
         step_for_save = global_step + 1
+        loss_suffix = f"_vlm{vlm_loss.item():.4f}_ae{ae_loss.item():.4f}"
         if lora_enabled:
             # LoRA mode: only save lora.safetensors (small, no extra memory).
             # Use scripts/merge_lora.py to merge into a full model for eval.
             if is_main and step_for_save % save_interval == 0:
                 import openpi.models_pytorch.lora_pytorch as lora_utils
-                ckpt_dir = save_dir / f"{step_for_save}"
+                ckpt_dir = save_dir / f"{step_for_save}{loss_suffix}"
                 ckpt_dir.mkdir(parents=True, exist_ok=True)
                 lora_utils.save_lora_checkpoint(model, str(ckpt_dir / "lora.safetensors"))
                 torch.save({"global_step": step_for_save}, str(ckpt_dir / "metadata.pt"))
+                logging.info(f"Saved LoRA checkpoint step {step_for_save} -> {ckpt_dir}")
         else:
-            save_checkpoint(model, optimizer, step_for_save, save_dir, is_main, save_interval)
+            save_checkpoint(model, optimizer, step_for_save, save_dir, is_main, save_interval, suffix=loss_suffix)
         if pbar:
             pbar.update(1)
             pbar.set_postfix(

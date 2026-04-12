@@ -34,7 +34,7 @@ pretrained_weight_path: /workspace/model/pi05_base_pytorch
 
 # --- Joint training ---
 gradient_strategy: scale_gradient       # "none" | "stop_gradient" | "scale_gradient" | "freeze_backbone"
-gradient_scale: 0.3                     # only used when gradient_strategy=scale_gradient (fraction of AE gradient flowing into backbone K/V)
+gradient_scale: 0.4                     # only used when gradient_strategy=scale_gradient (fraction of AE gradient flowing into backbone K/V)
 ae_loss_weight: 1.0
 
 # Batch sizes (per GPU)
@@ -44,7 +44,7 @@ ae_batch_size: 20
 # Training hyperparameters
 num_train_steps: 10000
 warmup_steps: 1000
-peak_lr: 2.0e-4
+peak_lr: 1.0e-4
 end_lr: 1.0e-5
 
 # Normalization
@@ -61,15 +61,20 @@ image_aug_cfg:
   saturation: [0.8, 1.2]
   hue: 0.05
 
+# AE sliding-window data augmentation: for each waypoint pair, generate up to
+# (2*N+1) samples by shifting the action window by -N..+N steps while keeping
+# duration constant.  0 = disabled, 2 = shift ±2 (~5x data, ~71k samples).
+ae_max_shift: 2
+
 # Shuffle buffers
 vlm_shuffle_buffer_size: 5000
-ae_shuffle_buffer_size: 1000
+ae_shuffle_buffer_size: 5000
 
 # Logging and checkpointing
-exp_name: waypoint_joint_libero_10_lora_sg_0.3_4090_4gpu
-checkpoint_dir: /workspace/openpi/checkpoints/{exp_name}
-save_interval: 1000
-log_interval: 100
+exp_name: waypoint_joint_libero_10_lora_sg_0.4_5090_4gpu_ae_agu_fix_shift_range
+checkpoint_dir: /workspace/ae_agu/checkpoints/{exp_name}
+save_interval: 500
+log_interval: 20
 wandb_enabled: true
 wandb_project: waypoint_e2e
 

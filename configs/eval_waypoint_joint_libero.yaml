@@ -12,7 +12,7 @@ task_suite: libero_10
 # For LoRA-trained models, use the merged checkpoint (model_merged.safetensors):
 #   the training script auto-exports it alongside lora.safetensors.
 #   eval loads model_merged.safetensors or model.safetensors from this dir.
-joint_checkpoint: /workspace/merged_models
+joint_checkpoint: /workspace/ae_agu/checkpoints/waypoint_joint_libero_10_lora_sg_0.4_5090_4gpu_ae_agu_fix_shift_range/5000_vlm0.4792_ae0.1015
 
 # Data / normalization
 dataset_statistics_path: /workspace/data/dataset_statistics.json
@@ -44,7 +44,7 @@ center_crop: true
 center_crop_scale: 0.9
 
 # Evaluation
-num_trials_per_task: 3
+num_trials_per_task: 5
 num_steps_wait: 10
 
 # Reproducibility: set eval_seed to fix flow matching noise for deterministic actions.
@@ -57,4 +57,4 @@ eval_seed: 7
 # deterministic_sdpa: true
 
 # Video output
-video_out_path: /workspace/merged_models/eval_libero_run3/videos
+video_out_path: /workspace/ae_agu/checkpoints/waypoint_joint_libero_10_lora_sg_0.4_5090_4gpu_ae_agu_fix_shift_range/5000_vlm0.4792_ae0.1015/eval_libero_videos

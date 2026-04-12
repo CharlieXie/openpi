@@ -56,6 +56,7 @@ class WaypointAEDataset(IterableDataset):
         episode_shuffle_buffer: int = 0,
         image_aug: bool = False,
         image_aug_cfg: dict | None = None,
+        ae_max_shift: int = 0,
     ):
         super().__init__()
         self.original_rlds_dir = original_rlds_dir
@@ -68,6 +69,7 @@ class WaypointAEDataset(IterableDataset):
         self.shuffle_buffer_size = shuffle_buffer_size
         self.image_size = image_size
         self.episode_shuffle_buffer = episode_shuffle_buffer
+        self.ae_max_shift = ae_max_shift
 
         self.norm_helper = NormalizationHelper(dataset_statistics, norm_type)
 
@@ -90,25 +92,40 @@ class WaypointAEDataset(IterableDataset):
             wp_data = json.load(f)
 
         self.episode_wp_map: dict[int, list[tuple[int, int, int]]] = {}
+        self.episode_lengths: dict[int, int] = {}
         total_pairs = 0
+        total_augmented = 0
         skipped = 0
         for ep in wp_data["episodes"]:
+            ep_idx = ep["src_ep_idx"]
+            ep_len = ep.get("original_steps", 0)
+            self.episode_lengths[ep_idx] = ep_len
             wp_indices = ep["waypoint_indices"]
             valid_pairs = []
             for i in range(len(wp_indices) - 1):
                 dur = wp_indices[i + 1] - wp_indices[i]
                 if dur <= max_duration:
-                    valid_pairs.append((wp_indices[i], wp_indices[i + 1], dur))
+                    w_start = wp_indices[i]
+                    w_end = wp_indices[i + 1]
+                    valid_pairs.append((w_start, w_end, dur))
+                    if ae_max_shift > 0:
+                        min_s = max(-ae_max_shift, -w_start)
+                        max_s = min(ae_max_shift, ep_len - w_end - 1)
+                        total_augmented += max(0, max_s - min_s + 1)
                 else:
                     skipped += 1
             if valid_pairs:
-                self.episode_wp_map[ep["src_ep_idx"]] = valid_pairs
+                self.episode_wp_map[ep_idx] = valid_pairs
                 total_pairs += len(valid_pairs)
 
-        self.total_pairs = total_pairs
+        if ae_max_shift > 0:
+            self.total_pairs = total_augmented
+        else:
+            self.total_pairs = total_pairs
         logger.info(
             f"WaypointAEDataset: {len(self.episode_wp_map)} episodes, "
             f"{total_pairs} valid pairs, {skipped} skipped (dur>{max_duration}), "
+            f"ae_max_shift={ae_max_shift} → {self.total_pairs} total samples, "
             f"actual_action={robot_config.actual_action_dim}→{model_action_dim}, "
             f"proprio={robot_config.continuous_proprio_dim}+1grip={ae_proprio_dim}→{model_proprio_dim}, "
             f"episode_shuffle_buffer={episode_shuffle_buffer}"
@@ -118,73 +135,81 @@ class WaypointAEDataset(IterableDataset):
         return self.total_pairs
 
     def _process_episode(self, steps, wp_pairs, rc):
-        """Extract waypoint-pair samples from a single episode's steps."""
+        """Extract waypoint-pair samples from a single episode's steps.
+
+        When ``ae_max_shift`` > 0, each waypoint pair is augmented by
+        shifting the action window by -max_shift .. +max_shift steps
+        (bidirectional) while keeping duration constant.  shift=0 is the
+        original unaugmented sample.  Invalid shifts (window out of
+        episode bounds) are silently skipped.
+        """
+        num_steps = len(steps)
+
         all_actions_raw = np.stack([s["action"].numpy() for s in steps])
         all_actions = rc.normalize_gripper(all_actions_raw)
         all_actions = all_actions[:, rc.action_dim_indices]
         all_actions = self.norm_helper.normalize_actions(all_actions)
 
+        all_proprios_7d = np.empty((num_steps, rc.continuous_proprio_dim + 1), dtype=np.float32)
+        for t in range(num_steps):
+            obs_dict = {k: steps[t]["observation"][k] for k in steps[t]["observation"]}
+            raw = extract_proprio_from_obs(obs_dict, rc.state_obs_keys)
+            cont, grip = rc.split_proprio(raw)
+            cont_norm = self.norm_helper.normalize_proprio(cont)
+            all_proprios_7d[t, :rc.continuous_proprio_dim] = cont_norm
+            all_proprios_7d[t, rc.continuous_proprio_dim] = float(grip)
+
         instruction = steps[0]["language_instruction"].numpy()
         if isinstance(instruction, bytes):
             instruction = instruction.decode("utf-8")
 
+        max_s = self.ae_max_shift
         for w_start, w_end, duration in wp_pairs:
-            if w_end >= len(steps):
-                continue
+            if max_s > 0:
+                shifts = range(-max_s, max_s + 1)
+            else:
+                shifts = range(1)
+            for shift in shifts:
+                new_start = w_start + shift
+                new_end = new_start + duration
+                if new_start < 0 or new_end >= num_steps:
+                    continue
 
-            images = {}
-            for view, rlds_key in rc.camera_rlds_keys.items():
-                model_key = rc.camera_model_keys[view]
-                img_data = steps[w_start]["observation"][rlds_key].numpy()
-                img = Image.fromarray(img_data)
-                if img.size != self.image_size:
-                    img = img.resize(self.image_size, Image.BILINEAR)
-                if self.image_aug_transform is not None:
-                    img = self.image_aug_transform(img)
-                images[model_key] = np.array(img, dtype=np.uint8)
+                images = {}
+                for view, rlds_key in rc.camera_rlds_keys.items():
+                    model_key = rc.camera_model_keys[view]
+                    img_data = steps[new_start]["observation"][rlds_key].numpy()
+                    img = Image.fromarray(img_data)
+                    if img.size != self.image_size:
+                        img = img.resize(self.image_size, Image.BILINEAR)
+                    if self.image_aug_transform is not None:
+                        img = self.image_aug_transform(img)
+                    images[model_key] = np.array(img, dtype=np.uint8)
 
-            start_proprio_raw = extract_proprio_from_obs(
-                {k: steps[w_start]["observation"][k] for k in steps[w_start]["observation"]},
-                rc.state_obs_keys,
-            )
-            end_proprio_raw = extract_proprio_from_obs(
-                {k: steps[w_end]["observation"][k] for k in steps[w_end]["observation"]},
-                rc.state_obs_keys,
-            )
+                start_proprio = pad_to_dim(all_proprios_7d[new_start], self.model_proprio_dim)
+                end_proprio = pad_to_dim(all_proprios_7d[new_end], self.model_proprio_dim)
 
-            # Split into continuous dims + binary gripper, normalize
-            # continuous, then reassemble as 7D: [continuous_norm, grip_binary]
-            start_cont, start_grip = rc.split_proprio(start_proprio_raw)
-            end_cont, end_grip = rc.split_proprio(end_proprio_raw)
-            start_cont_norm = self.norm_helper.normalize_proprio(start_cont)
-            end_cont_norm = self.norm_helper.normalize_proprio(end_cont)
-            start_7d = np.concatenate([start_cont_norm, [float(start_grip)]])
-            end_7d = np.concatenate([end_cont_norm, [float(end_grip)]])
+                seg_actions = all_actions[new_start:new_end]
+                actual_len = len(seg_actions)
+                padded_actions = np.zeros(
+                    (self.horizon_steps, self.model_action_dim), dtype=np.float32
+                )
+                padded_actions[:actual_len, :rc.actual_action_dim] = seg_actions[:actual_len]
 
-            start_proprio = pad_to_dim(start_7d, self.model_proprio_dim)
-            end_proprio = pad_to_dim(end_7d, self.model_proprio_dim)
+                action_pad_mask = np.zeros(self.horizon_steps, dtype=bool)
+                action_pad_mask[actual_len:] = True
 
-            seg_actions = all_actions[w_start:w_end]
-            actual_len = len(seg_actions)
-            padded_actions = np.zeros(
-                (self.horizon_steps, self.model_action_dim), dtype=np.float32
-            )
-            padded_actions[:actual_len, : rc.actual_action_dim] = seg_actions[:actual_len]
-
-            action_pad_mask = np.zeros(self.horizon_steps, dtype=bool)
-            action_pad_mask[actual_len:] = True
-
-            yield {
-                "images": images,
-                "instruction": instruction,
-                "start_proprio": start_proprio.astype(np.float32),
-                "end_proprio": end_proprio.astype(np.float32),
-                "duration": float(duration),
-                "actions": padded_actions.astype(np.float32),
-                "action_pad_mask": action_pad_mask,
-                "action_dim_mask": self.action_dim_mask.copy(),
-                "proprio_dim_mask": self.proprio_dim_mask.copy(),
-            }
+                yield {
+                    "images": images,
+                    "instruction": instruction,
+                    "start_proprio": start_proprio.astype(np.float32),
+                    "end_proprio": end_proprio.astype(np.float32),
+                    "duration": float(duration),
+                    "actions": padded_actions.astype(np.float32),
+                    "action_pad_mask": action_pad_mask,
+                    "action_dim_mask": self.action_dim_mask.copy(),
+                    "proprio_dim_mask": self.proprio_dim_mask.copy(),
+                }
 
     def _raw_sample_iter(self):
         """Yield raw samples from RLDS. DDP-aware, repeats indefinitely.

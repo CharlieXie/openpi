@@ -3,11 +3,11 @@
 
 robot_type: libero
 
-# Data paths
-wp_rlds_dir: /workspace/data/libero/libero_object_wp_001/waypoint_filtered_rlds__libero/1.0.0
-dataset_statistics_path: /workspace/data/libero_object_no_noops/1.0.0
+# --- Data paths ---
+wp_rlds_dir: /workspace/data/libero_10_wp_0006/waypoint_filtered_rlds__libero/1.0.0
+dataset_statistics_path: /workspace/data/dataset_statistics.json
 
-# Model architecture
+# --- Model architecture ---
 paligemma_variant: gemma_2b
 action_expert_variant: gemma_300m  # Only needed for weight extraction
 precision: bfloat16
@@ -18,22 +18,22 @@ max_token_len: 256
 stride: 1
 
 # Pretrained weights (Pi0.5 base — will extract PaliGemma portion)
-pretrained_weight_path: /workspace/models/pi05_base_pytorch
+pretrained_weight_path: /workspace/model/pi05_base_pytorch
 
 # Training hyperparameters
-batch_size: 320
-num_train_steps: 2000
-warmup_steps: 40
-peak_lr: 3.0e-5
-end_lr: 1.0e-7
+batch_size: 20
+num_train_steps: 10000
+warmup_steps: 1000
+peak_lr: 1.0e-4
+end_lr: 1.0e-5
 
 # Normalization
 norm_type: q99
 
-# Image augmentation (matching galaxea_0 reference defaults)
+# Image augmentation — aligned with joint config (VLA-Adapter style)
 image_aug: true
 image_aug_cfg:
-  random_resized_crop_scale: [0.9, 1.0]
+  random_resized_crop_scale: [0.9, 0.9]
   brightness: 0.2
   contrast: [0.8, 1.2]
   saturation: [0.8, 1.2]
@@ -41,19 +41,46 @@ image_aug_cfg:
 
 # Shuffle
 shuffle_buffer_size: 5000
+# Episode-level shuffle (for multi-suite training, 0 = disabled)
+episode_shuffle_buffer_size: 0
+
+# Data prefetching
+prefetch: true
 
 # Logging and checkpointing
-exp_name: waypoint_vlm_libero_fix1
-checkpoint_dir: checkpoints/waypoint_vlm_libero_fix1
-save_interval: 200
-log_interval: 5
+exp_name: waypoint_vlm_libero
+checkpoint_dir: checkpoints/{exp_name}
+save_interval: 500
+log_interval: 20
 wandb_enabled: true
+wandb_project: waypoint_e2e
 
-# LoRA (set to true for low-memory training)
-lora_enabled: false
+# LoRA (set to true for parameter-efficient fine-tuning)
+lora_enabled: true
 lora_rank: 16
 lora_alpha: 16.0
-train_vision_encoder: true
+lora_init: "gaussian"              # true/"kaiming" (default) or "gaussian"
+lora_dropout: 0.0
+# lora_use_rslora: false
+lora_apply_to: backbone_only      # "all" | "backbone_only" | "expert_only"
+vision_encoder_mode: lora          # "freeze" (default) | "lora" | "full"
+
+# LoRA skip-list / trainable-list (uncomment to override defaults)
+# lora_modules_to_skip:
+#   - action_in_proj
+#   - action_out_proj
+#   - proprio_encoder
+#   - time_mlp_in
+#   - time_mlp_out
+#   - multi_modal_projector
+#   - lm_head
+# lora_trainable_modules:
+#   - action_in_proj
+#   - action_out_proj
+#   - proprio_encoder
+#   - time_mlp_in
+#   - time_mlp_out
+#   - multi_modal_projector
 
 # Resume from checkpoint
 resume: false

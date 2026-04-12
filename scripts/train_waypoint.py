@@ -15,7 +15,9 @@ import argparse
 import gc
 import logging
 import os
+import queue
 import shutil
+import threading
 import time
 from pathlib import Path
 
@@ -71,11 +73,12 @@ def cleanup_ddp():
         dist.destroy_process_group()
 
 
-def save_checkpoint(model, optimizer, step, save_dir, is_main, save_interval):
+def save_checkpoint(model, optimizer, step, save_dir, is_main, save_interval, suffix=""):
     if not is_main or step % save_interval != 0:
         return
-    final_dir = save_dir / f"{step}"
-    tmp_dir = save_dir / f"tmp_{step}"
+    dir_name = f"{step}{suffix}"
+    final_dir = save_dir / dir_name
+    tmp_dir = save_dir / f"tmp_{dir_name}"
     if tmp_dir.exists():
         shutil.rmtree(tmp_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -91,17 +94,37 @@ def save_checkpoint(model, optimizer, step, save_dir, is_main, save_interval):
     logging.info(f"Saved checkpoint step {step} -> {final_dir}")
 
 
+def _parse_step_from_dirname(name):
+    """Extract leading integer step number from checkpoint dir name.
+
+    Handles both old format ('500') and new format ('500_loss0.1234').
+    """
+    prefix = name.split("_", 1)[0]
+    if prefix.isdigit():
+        return int(prefix)
+    return None
+
+
 def load_latest_checkpoint(model, optimizer, save_dir, device):
-    steps = [int(d.name) for d in save_dir.iterdir() if d.is_dir() and d.name.isdigit()]
-    if not steps:
+    step_dir_pairs = []
+    for d in save_dir.iterdir():
+        if not d.is_dir() or d.name.startswith("tmp_"):
+            continue
+        step = _parse_step_from_dirname(d.name)
+        if step is not None:
+            step_dir_pairs.append((step, d))
+    if not step_dir_pairs:
         return 0
-    latest = max(steps)
-    ckpt = save_dir / str(latest)
+    latest_step, ckpt = max(step_dir_pairs, key=lambda x: x[0])
     model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-    safetensors.torch.load_model(model_to_load, ckpt / "model.safetensors", device=str(device))
-    optimizer.load_state_dict(torch.load(ckpt / "optimizer.pt", map_location=device, weights_only=False))
+    model_file = ckpt / "model.safetensors"
+    if model_file.exists():
+        safetensors.torch.load_model(model_to_load, model_file, device=str(device))
+    opt_file = ckpt / "optimizer.pt"
+    if opt_file.exists():
+        optimizer.load_state_dict(torch.load(opt_file, map_location=device, weights_only=False))
     meta = torch.load(ckpt / "metadata.pt", map_location=device, weights_only=False)
-    logging.info(f"Resumed from step {meta['global_step']}")
+    logging.info(f"Resumed from step {meta['global_step']} ({ckpt.name})")
     return meta["global_step"]
 
 
@@ -115,13 +138,75 @@ def cosine_lr(step, warmup, peak_lr, decay_steps, end_lr):
 
 
 # ---------------------------------------------------------------------------
-# Action Expert training
+# Shared utilities
 # ---------------------------------------------------------------------------
+
+class _PrefetchIter:
+    """Background-thread prefetcher for a DataLoader."""
+
+    def __init__(self, loader, prefetch_count=2):
+        self._loader = loader
+        self._queue: queue.Queue = queue.Queue(maxsize=prefetch_count)
+        self._stop = threading.Event()
+        self._exception: BaseException | None = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        it = iter(self._loader)
+        while not self._stop.is_set():
+            try:
+                batch = next(it)
+            except StopIteration:
+                it = iter(self._loader)
+                batch = next(it)
+            except Exception as exc:
+                self._exception = exc
+                return
+            self._queue.put(batch)
+
+    def __next__(self):
+        if self._exception is not None:
+            raise self._exception
+        return self._queue.get()
+
+    def stop(self):
+        self._stop.set()
+
 
 def count_params(model):
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
+
+
+def _apply_lora(model, cfg):
+    """Apply LoRA to model using the new unified API. Returns (lora_cfg, frozen, trainable)."""
+    import openpi.models_pytorch.lora_pytorch as lora_utils
+
+    vision_mode = cfg.get("vision_encoder_mode", None)
+    if vision_mode is None:
+        vision_mode = "full" if cfg.get("train_vision_encoder", False) else "freeze"
+
+    lora_kwargs = dict(
+        enabled=True,
+        rank=cfg.get("lora_rank", 16),
+        alpha=cfg.get("lora_alpha", 16.0),
+        dropout=cfg.get("lora_dropout", 0.0),
+        use_rslora=cfg.get("lora_use_rslora", False),
+        init_lora_weights=cfg.get("lora_init", True),
+        vision_encoder_mode=vision_mode,
+        apply_to=cfg.get("lora_apply_to", "all"),
+    )
+    if "lora_modules_to_skip" in cfg:
+        lora_kwargs["modules_to_not_lora"] = cfg["lora_modules_to_skip"]
+    if "lora_trainable_modules" in cfg:
+        lora_kwargs["trainable_non_lora_modules"] = cfg["lora_trainable_modules"]
+    lora_cfg = lora_utils.LoRATrainingConfig(**lora_kwargs)
+    frozen, trainable = lora_utils.apply_lora_to_model(model, lora_cfg)
+    lora_utils.print_lora_summary(model)
+    logging.info(f"LoRA applied: {trainable:,} trainable, {frozen:,} frozen")
+    return lora_cfg, frozen, trainable
 
 
 def init_wandb(cfg, mode, is_main, resuming=False):
@@ -167,6 +252,10 @@ def train_ae(cfg, device, use_ddp, is_main):
         model_action_dim=cfg.get("model_action_dim", 32),
         model_proprio_dim=cfg.get("model_proprio_dim", 32),
         shuffle_buffer_size=cfg.get("shuffle_buffer_size", 10000),
+        episode_shuffle_buffer=cfg.get("episode_shuffle_buffer_size", 0),
+        image_aug=cfg.get("image_aug", False),
+        image_aug_cfg=cfg.get("image_aug_cfg", None),
+        ae_max_shift=cfg.get("ae_max_shift", 0),
     )
     collator = WaypointAECollator()
     loader = torch.utils.data.DataLoader(
@@ -184,7 +273,7 @@ def train_ae(cfg, device, use_ddp, is_main):
         dtype=cfg.get("precision", "bfloat16"),
     )
 
-    model = PI0WaypointAE(model_cfg, aug_cfg=cfg.get("image_aug_cfg", None)).to(device)
+    model = PI0WaypointAE(model_cfg).to(device)
     model.gradient_checkpointing_enable()
     if is_main:
         log_gpu_memory(device, prefix="[After model init] ")
@@ -220,20 +309,9 @@ def train_ae(cfg, device, use_ddp, is_main):
         if is_main:
             log_gpu_memory(device, prefix="[After weight load] ")
 
-    if cfg.get("lora_enabled", False):
-        import openpi.models_pytorch.lora_pytorch as lora_utils
-        lora_cfg = lora_utils.LoRATrainingConfig(
-            enabled=True,
-            attn_rank=cfg.get("lora_rank", 16),
-            ffn_rank=cfg.get("lora_rank", 16),
-            attn_alpha=cfg.get("lora_alpha", 16.0),
-            ffn_alpha=cfg.get("lora_alpha", 16.0),
-            apply_to="all",
-            train_non_lora_layers=True,
-            train_vision_encoder=cfg.get("train_vision_encoder", True),
-        )
-        frozen, trainable = lora_utils.apply_lora_to_pi0_pytorch(model, lora_cfg)
-        logging.info(f"LoRA applied: {trainable:,} trainable, {frozen:,} frozen")
+    lora_enabled = cfg.get("lora_enabled", False)
+    if lora_enabled:
+        _apply_lora(model, cfg)
 
     if use_ddp:
         model = torch.nn.parallel.DistributedDataParallel(
@@ -286,9 +364,33 @@ def train_ae(cfg, device, use_ddp, is_main):
     start_time = time.time()
     infos = []
 
-    for batch in loader:
-        if global_step >= num_steps:
-            break
+    use_prefetch = cfg.get("prefetch", True)
+    if use_prefetch:
+        data_iter = _PrefetchIter(loader, prefetch_count=2)
+        if is_main:
+            logging.info("Data prefetching enabled (threaded, prefetch_count=2)")
+    else:
+        data_iter = iter(loader)
+
+    class _Obs:
+        def __init__(self, b):
+            self.images = b["images"]
+            self.image_masks = b["image_masks"]
+            self.state = b["start_proprio"]
+            self.tokenized_prompt = b["prompt_tokens"]
+            self.tokenized_prompt_mask = b["prompt_masks"]
+            self.token_ar_mask = None
+            self.token_loss_mask = None
+
+    for global_step in range(global_step, num_steps):
+        if use_prefetch:
+            batch = next(data_iter)
+        else:
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(loader)
+                batch = next(data_iter)
 
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
         for k in list(batch.get("images", {}).keys()):
@@ -299,15 +401,6 @@ def train_ae(cfg, device, use_ddp, is_main):
         for pg in optimizer.param_groups:
             pg["lr"] = cosine_lr(global_step, warmup, peak_lr, decay_steps, end_lr)
 
-        class _Obs:
-            def __init__(self, b):
-                self.images = b["images"]
-                self.image_masks = b["image_masks"]
-                self.state = b["start_proprio"]
-                self.tokenized_prompt = b["prompt_tokens"]
-                self.tokenized_prompt_mask = b["prompt_masks"]
-                self.token_ar_mask = None
-                self.token_loss_mask = None
         obs = _Obs(batch)
 
         loss = model(
@@ -354,14 +447,26 @@ def train_ae(cfg, device, use_ddp, is_main):
             infos = []
             start_time = time.time()
 
-        global_step += 1
-        save_checkpoint(model, optimizer, global_step, save_dir, is_main, save_interval)
+        step_for_save = global_step + 1
+        loss_suffix = f"_loss{loss.item():.4f}"
+        if lora_enabled:
+            if is_main and step_for_save % save_interval == 0:
+                import openpi.models_pytorch.lora_pytorch as lora_utils
+                ckpt_dir = save_dir / f"{step_for_save}{loss_suffix}"
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+                lora_utils.save_lora_checkpoint(model, str(ckpt_dir / "lora.safetensors"))
+                torch.save({"global_step": step_for_save}, str(ckpt_dir / "metadata.pt"))
+                logging.info(f"Saved LoRA checkpoint step {step_for_save} -> {ckpt_dir}")
+        else:
+            save_checkpoint(model, optimizer, step_for_save, save_dir, is_main, save_interval, suffix=loss_suffix)
         if pbar:
             pbar.update(1)
-            pbar.set_postfix(loss=f"{loss.item():.4f}", step=global_step)
+            pbar.set_postfix(loss=f"{loss.item():.4f}", step=step_for_save)
 
     if pbar:
         pbar.close()
+    if use_prefetch:
+        data_iter.stop()
     wandb.finish()
 
 
@@ -398,6 +503,7 @@ def train_vlm(cfg, device, use_ddp, is_main):
         shuffle_buffer_size=cfg.get("shuffle_buffer_size", 5000),
         image_aug=cfg.get("image_aug", False),
         image_aug_cfg=cfg.get("image_aug_cfg", None),
+        episode_shuffle_buffer=cfg.get("episode_shuffle_buffer_size", 0),
     )
     collator = WaypointVLMCollator()
     loader = torch.utils.data.DataLoader(
@@ -440,18 +546,9 @@ def train_vlm(cfg, device, use_ddp, is_main):
         if is_main:
             log_gpu_memory(device, prefix="[After weight load] ")
 
-    if cfg.get("lora_enabled", False):
-        import openpi.models_pytorch.lora_pytorch as lora_utils
-        lora_cfg = lora_utils.LoRATrainingConfig(
-            enabled=True,
-            attn_rank=cfg.get("lora_rank", 16),
-            ffn_rank=cfg.get("lora_rank", 16),
-            apply_to="paligemma_only",
-            train_non_lora_layers=False,
-            train_vision_encoder=cfg.get("train_vision_encoder", True),
-        )
-        frozen, trainable = lora_utils.apply_lora_to_pi0_pytorch(model, lora_cfg)
-        logging.info(f"LoRA applied: {trainable:,} trainable, {frozen:,} frozen")
+    lora_enabled = cfg.get("lora_enabled", False)
+    if lora_enabled:
+        _apply_lora(model, cfg)
 
     if use_ddp:
         model = torch.nn.parallel.DistributedDataParallel(
@@ -502,9 +599,23 @@ def train_vlm(cfg, device, use_ddp, is_main):
     start_time = time.time()
     infos = []
 
-    for batch in loader:
-        if global_step >= num_steps:
-            break
+    use_prefetch = cfg.get("prefetch", True)
+    if use_prefetch:
+        data_iter = _PrefetchIter(loader, prefetch_count=2)
+        if is_main:
+            logging.info("Data prefetching enabled (threaded, prefetch_count=2)")
+    else:
+        data_iter = iter(loader)
+
+    for global_step in range(global_step, num_steps):
+        if use_prefetch:
+            batch = next(data_iter)
+        else:
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(loader)
+                batch = next(data_iter)
 
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
         for k in list(batch.get("images", {}).keys()):
@@ -551,14 +662,26 @@ def train_vlm(cfg, device, use_ddp, is_main):
             infos = []
             start_time = time.time()
 
-        global_step += 1
-        save_checkpoint(model, optimizer, global_step, save_dir, is_main, save_interval)
+        step_for_save = global_step + 1
+        loss_suffix = f"_loss{loss.item():.4f}"
+        if lora_enabled:
+            if is_main and step_for_save % save_interval == 0:
+                import openpi.models_pytorch.lora_pytorch as lora_utils
+                ckpt_dir = save_dir / f"{step_for_save}{loss_suffix}"
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+                lora_utils.save_lora_checkpoint(model, str(ckpt_dir / "lora.safetensors"))
+                torch.save({"global_step": step_for_save}, str(ckpt_dir / "metadata.pt"))
+                logging.info(f"Saved LoRA checkpoint step {step_for_save} -> {ckpt_dir}")
+        else:
+            save_checkpoint(model, optimizer, step_for_save, save_dir, is_main, save_interval, suffix=loss_suffix)
         if pbar:
             pbar.update(1)
-            pbar.set_postfix(loss=f"{loss.item():.4f}", step=global_step)
+            pbar.set_postfix(loss=f"{loss.item():.4f}", step=step_for_save)
 
     if pbar:
         pbar.close()
+    if use_prefetch:
+        data_iter.stop()
     wandb.finish()
 
 
